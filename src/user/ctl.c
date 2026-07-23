@@ -17,6 +17,11 @@
 #define CALY_USERSPACE 1
 #endif
 
+/* common.h uses the fixed-width kernel types (__u32/__u8/...) but does not
+ * include their definition: on the BPF side they come from vmlinux.h, on the
+ * userspace side from <linux/types.h>. Pull that in BEFORE common.h. */
+#include <linux/types.h>
+
 #include "common.h"
 #include "loader.h"
 #include "util.h"
@@ -853,7 +858,7 @@ static void ctl_emit_addr(struct sbuf *d, __u32 family, const __u8 *addr)
 
 /* =========================================================================
  * Command handlers. Each appends the "data" VALUE to `d` and returns 0, or
- * returns -1 with *code/*msg set for an error response.
+ * returns -1 with the code and msg out-params set for an error response.
  * ========================================================================= */
 
 static int h_ping(struct sbuf *d)

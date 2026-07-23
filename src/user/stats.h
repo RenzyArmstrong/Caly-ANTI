@@ -66,8 +66,8 @@ extern "C" {
  * Shared userspace primitives.
  *
  * These are duplicated (identically, behind one-shot guards) in every
- * src/user/*.h that needs them so that no header in this component depends on
- * another. Including any two of them in either order is well defined.
+ * header under src/user that needs them so that no header in this component
+ * depends on another. Including any two of them in either order is well defined.
  * ------------------------------------------------------------------------- */
 
 #ifndef CALY_LOG_FN_DEFINED

@@ -52,8 +52,24 @@
 #define CALY_ABI_VERSION        ((CALY_ABI_VERSION_MAJOR << 16) | \
                                  CALY_ABI_VERSION_MINOR)
 
+/*
+ * On the BPF side we do NOT force-inline the helpers. Force-inlining the whole
+ * dataplane into caly_xdp_main flattens ~56 helpers into one function and blows
+ * past the verifier's complexity budget (BPF_PROG_LOAD -> -E2BIG, "Argument
+ * list too long"). Letting the compiler's cost model decide makes the large
+ * helpers BPF-to-BPF subprograms that the verifier checks once; 5.x kernels
+ * support this fully. (The 4.18 ground-rule note is why it used to be forced.)
+ * We also downgrade the raw __always_inline used in a few files the same way.
+ * Userspace keeps the strong hint - those are tiny formatting helpers.
+ */
 #ifndef CALY_INLINE
+#ifdef CALY_USERSPACE
 #define CALY_INLINE static inline __attribute__((always_inline))
+#else
+#define CALY_INLINE static inline
+#undef  __always_inline
+#define __always_inline inline
+#endif
 #endif
 
 /* `#pragma unroll` is a clang extension. GCC (which builds the userspace

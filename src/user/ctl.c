@@ -914,13 +914,13 @@ static void ctl_emit_config(const struct fw_config *c, struct sbuf *d)
 	sb_key(d, "dataplane_pref");     sb_u64(d, c->dataplane_pref);     sb_putc(d, ',');
 
 	sb_key(d, "mgmt_tcp_ports"); sb_putc(d, '[');
-	for (i = 0; i < (int)c->mgmt_tcp_count && i < CALY_MGMT_PORTS_MAX; i++) {
+	for (i = 0; i < (int)c->mgmt_tcp_count && i < (int)CALY_MGMT_PORTS_MAX; i++) {
 		if (i) sb_putc(d, ',');
 		sb_u64(d, c->mgmt_tcp_ports[i]);
 	}
 	sb_puts(d, "],");
 	sb_key(d, "mgmt_udp_ports"); sb_putc(d, '[');
-	for (i = 0; i < (int)c->mgmt_udp_count && i < CALY_MGMT_PORTS_MAX; i++) {
+	for (i = 0; i < (int)c->mgmt_udp_count && i < (int)CALY_MGMT_PORTS_MAX; i++) {
 		if (i) sb_putc(d, ',');
 		sb_u64(d, c->mgmt_udp_ports[i]);
 	}

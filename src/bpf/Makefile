@@ -107,6 +107,7 @@ BPF_FEATURES := $(OBJDIR)/caly_bpf_features.h
 BPF_CFLAGS := -g -O2 -target bpf -mcpu=$(BPF_CPU) \
 	-Wall -Wno-unused-function -Wno-compare-distinct-pointer-types \
 	-Wno-address-of-packed-member -Wno-gnu-variable-sized-type-not-at-end \
+	-Wno-pass-failed \
 	-fno-stack-protector \
 	-D__TARGET_ARCH_$(SRCARCH) -DCALY_SPLIT_IPV6=$(SPLIT_IPV6) \
 	-I$(BPFDIR) -I$(dir $(VMLINUX_H)) $(LIBBPF_CFLAGS)

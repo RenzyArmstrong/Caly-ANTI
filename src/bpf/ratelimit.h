@@ -45,20 +45,20 @@
  * the real consume can never diverge. Used by the simulator and by paths that
  * must test one bucket before deciding whether to charge several.
  * ------------------------------------------------------------------------- */
-CALY_INLINE int caly_tb_peek(const struct token_bucket *tb, __u64 now_ns,
+CALY_INLINE int caly_tb_peek(const struct caly_token_bucket *tb, __u64 now_ns,
 			     __u64 rate, __u64 burst, __u64 want)
 {
-	struct token_bucket tmp = *tb;
+	struct caly_token_bucket tmp = *tb;
 
 	return caly_tb_consume(&tmp, now_ns, rate, burst, want);
 }
 
 /* Tokens available after refilling a copy, for reporting the depth an event
  * fired at. Never used to make a drop decision. */
-CALY_INLINE __u64 caly_tb_avail(const struct token_bucket *tb, __u64 now_ns,
+CALY_INLINE __u64 caly_tb_avail(const struct caly_token_bucket *tb, __u64 now_ns,
 				__u64 rate, __u64 burst)
 {
-	struct token_bucket tmp = *tb;
+	struct caly_token_bucket tmp = *tb;
 
 	if (rate == 0 || burst == 0)
 		return burst;
@@ -186,12 +186,12 @@ CALY_INLINE int caly_rate_syn_ok(struct rate_state *rs,
  * The pre-5.15 path also enforces cfg.syn_fallback_pps as a single shared cap
  * across all sources, catching a distributed spoofed-SYN flood that stays
  * under every per-source limit. There is no dedicated map for it in the ABI,
- * so the caller supplies the token_bucket (a slot it owns - e.g. a reserved
+ * so the caller supplies the caly_token_bucket (a slot it owns - e.g. a reserved
  * caly_port_tb index, or a per-CPU scratch word). rate 0 disables it.
  *
  * Returns 1 to permit, 0 to drop (charge STAT_DROP_RATE_GLOBAL_SYN).
  */
-CALY_INLINE int caly_syn_global_ok(struct token_bucket *tb, __u64 now_ns,
+CALY_INLINE int caly_syn_global_ok(struct caly_token_bucket *tb, __u64 now_ns,
 				   __u64 fallback_pps)
 {
 	__u64 burst;
@@ -211,12 +211,12 @@ CALY_INLINE int caly_syn_global_ok(struct token_bucket *tb, __u64 now_ns,
 /* -------------------------------------------------------------------------
  * Per-port rate limiting.
  *
- * Ties a port_rule to its token_bucket. CLOSED and OPEN modes never consult
+ * Ties a port_rule to its caly_token_bucket. CLOSED and OPEN modes never consult
  * the bucket (CLOSED is handled by the caller as a drop; OPEN passes). Only
  * RATELIMIT draws a token. Returns 1 to permit, 0 to drop
  * (charge STAT_DROP_PORT_RATE).
  * ------------------------------------------------------------------------- */
-CALY_INLINE int caly_port_rate_ok(struct token_bucket *tb,
+CALY_INLINE int caly_port_rate_ok(struct caly_token_bucket *tb,
 				  const struct port_rule *pr, __u64 now_ns)
 {
 	if (!pr || pr->mode != CALY_PORT_RATELIMIT)
@@ -454,6 +454,6 @@ CALY_INLINE __u64 caly_ban_base_ttl(const struct fw_config *cfg, __u32 reason)
  * ------------------------------------------------------------------------- */
 CALY_ASSERT(CALY_TB_MAX == 6, ratelimit_tb_kinds);
 CALY_ASSERT(sizeof(((struct rate_state *)0)->tb) ==
-	    CALY_TB_MAX * sizeof(struct token_bucket), ratelimit_tb_span);
+	    CALY_TB_MAX * sizeof(struct caly_token_bucket), ratelimit_tb_span);
 
 #endif /* __CALY_ANTI_RATELIMIT_H */

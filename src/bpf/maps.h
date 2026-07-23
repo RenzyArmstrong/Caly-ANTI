@@ -335,7 +335,7 @@ struct {
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
 	__type(key, __u32);
-	__type(value, struct token_bucket);
+	__type(value, struct caly_token_bucket);
 	__uint(max_entries, CALY_PORT_TB_ENTRIES);
 	CALY_MAP_PIN
 } caly_port_tb SEC(".maps");
@@ -523,7 +523,7 @@ CALY_INLINE struct port_rule *caly_port_rule(int is_udp, __u16 port)
 }
 
 /* Per-port token bucket state. `port` is HOST byte order. */
-CALY_INLINE struct token_bucket *caly_port_bucket(int is_udp, __u16 port)
+CALY_INLINE struct caly_token_bucket *caly_port_bucket(int is_udp, __u16 port)
 {
 	__u32 k = CALY_PORT_TB_IDX(is_udp, (__u32)port);
 

@@ -126,7 +126,7 @@ struct events_ctx {
 	__u64 next_flush_ns;
 	__u64 window_start_ns;
 
-	struct token_bucket log_tb;
+	struct caly_token_bucket log_tb;
 	__u64 log_rate;
 	__u64 log_burst;
 	__u64 lost_reported;           /* c->st.lost already accounted for   */

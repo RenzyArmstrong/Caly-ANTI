@@ -60,7 +60,7 @@
 struct caly_log_key_slot {
 	__u32              hash;
 	int                used;
-	struct token_bucket tb;
+	struct caly_token_bucket tb;
 	unsigned long long suppressed;
 	char               key[24];
 };
@@ -73,7 +73,7 @@ static struct {
 	int  initialised;
 	char ident[32];
 
-	struct token_bucket tb;
+	struct caly_token_bucket tb;
 	__u64 rate;
 	__u64 burst;
 

@@ -2184,7 +2184,7 @@ int caly_port_get(const struct caly_maps *m, int is_udp, __u32 port,
 
 int caly_port_tb_reset(const struct caly_maps *m, int is_udp, __u32 port)
 {
-	struct token_bucket tb;
+	struct caly_token_bucket tb;
 	__u32 idx;
 	int fd = caly_maps_fd(m, CALY_MAP_ID_PORT_TB);
 	int ret;

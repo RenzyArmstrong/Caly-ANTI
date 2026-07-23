@@ -1555,7 +1555,7 @@ int caly_xdp_main(struct xdp_md *ctx)
 			}
 
 			if (prule->mode == CALY_PORT_RATELIMIT) {
-				struct token_bucket *tb;
+				struct caly_token_bucket *tb;
 				__u32 tbi = CALY_PORT_TB_IDX(is_udp, key32);
 
 				tb = bpf_map_lookup_elem(&caly_port_tb, &tbi);
@@ -1884,7 +1884,7 @@ int caly_xdp_main(struct xdp_md *ctx)
 		 * charged above. Shares caly_port_tb slot 0 (TCP port 0),
 		 * which no real rule can ever occupy. */
 		if (!(flags & CALY_F_CAP_SYNPROXY) && cfg->syn_fallback_pps) {
-			struct token_bucket *gb;
+			struct caly_token_bucket *gb;
 
 			key32 = CALY_TB_GLOBAL_SYN;
 			gb = bpf_map_lookup_elem(&caly_port_tb, &key32);

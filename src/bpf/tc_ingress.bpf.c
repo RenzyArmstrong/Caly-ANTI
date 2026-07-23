@@ -1338,7 +1338,7 @@ int caly_tc_ingress(struct __sk_buff *skb)
 		if (pr) {
 			if (pr->mode == CALY_PORT_RATELIMIT) {
 				__u32 idx = CALY_PORT_TB_IDX(is_udp, dport_h);
-				struct token_bucket *tb =
+				struct caly_token_bucket *tb =
 					bpf_map_lookup_elem(&caly_port_tb, &idx);
 
 				if (tb && !caly_tb_consume(tb, now, pr->rate,

@@ -668,7 +668,7 @@ struct ban_entry {
  * there is no scaling factor and no floating point anywhere. Refill is exact
  * to the nanosecond because the remainder is carried in last_refill_ns.
  */
-struct token_bucket {
+struct caly_token_bucket {
 	__u64 tokens;
 	__u64 last_refill_ns;
 };
@@ -684,7 +684,7 @@ struct token_bucket {
  * Statistics counters, which must be exact, live in PERCPU maps instead.
  */
 struct rate_state {
-	struct token_bucket tb[CALY_TB_MAX];  /* indexed by enum caly_tb_kind */
+	struct caly_token_bucket tb[CALY_TB_MAX];  /* indexed by enum caly_tb_kind */
 	__u64 window_start_ns;                /* strike window opened at      */
 	__u64 last_seen_ns;
 	__u32 strikes;                        /* strikes inside the window    */
@@ -758,7 +758,7 @@ struct port_rule {
 	__u32 flags;       /* CALY_PORT_F_*                                   */
 };
 
-/* Index into caly_port_tb (ARRAY of struct token_bucket, 2*65536 entries). */
+/* Index into caly_port_tb (ARRAY of struct caly_token_bucket, 2*65536 entries). */
 #define CALY_PORT_TB_TCP_BASE   0u
 #define CALY_PORT_TB_UDP_BASE   65536u
 #define CALY_PORT_TB_ENTRIES    131072u
@@ -1084,7 +1084,7 @@ struct fw_config {
  * global state; the caller supplies the timestamp.
  * ------------------------------------------------------------------------- */
 
-CALY_INLINE void caly_tb_init(struct token_bucket *tb, __u64 now_ns, __u64 burst)
+CALY_INLINE void caly_tb_init(struct caly_token_bucket *tb, __u64 now_ns, __u64 burst)
 {
 	tb->tokens = burst;
 	tb->last_refill_ns = now_ns;
@@ -1096,7 +1096,7 @@ CALY_INLINE void caly_tb_init(struct token_bucket *tb, __u64 now_ns, __u64 burst
  * bucket is exhausted. A rate or burst of 0 disables the bucket entirely and
  * always returns 1 - a misconfigured limiter must never black-hole traffic.
  */
-CALY_INLINE int caly_tb_consume(struct token_bucket *tb, __u64 now_ns,
+CALY_INLINE int caly_tb_consume(struct caly_token_bucket *tb, __u64 now_ns,
 				__u64 rate, __u64 burst, __u64 want)
 {
 	__u64 elapsed, add, consumed_ns;
@@ -1582,7 +1582,7 @@ CALY_ASSERT(sizeof(struct lpm_key_v6) == 20,           lpm_key_v6_size);
 CALY_ASSERT(sizeof(struct in6_key) == 16,              in6_key_size);
 CALY_ASSERT(sizeof(struct rule_meta) == 24,            rule_meta_size);
 CALY_ASSERT(sizeof(struct ban_entry) == 64,            ban_entry_size);
-CALY_ASSERT(sizeof(struct token_bucket) == 16,         token_bucket_size);
+CALY_ASSERT(sizeof(struct caly_token_bucket) == 16,         token_bucket_size);
 CALY_ASSERT(sizeof(struct rate_state) == 128,          rate_state_size);
 CALY_ASSERT(sizeof(struct conn_key) == 40,             conn_key_size);
 CALY_ASSERT(sizeof(struct conn_state) == 64,           conn_state_size);
@@ -1639,7 +1639,7 @@ CALY_ASSERT(__builtin_offsetof(struct conn_key, pad) == 38, conn_key_pad_off);
 
 /* The bucket array and the config rate arrays must stay index-compatible. */
 CALY_ASSERT(sizeof(((struct rate_state *)0)->tb) ==
-	    CALY_TB_MAX * sizeof(struct token_bucket), rate_state_tb_len);
+	    CALY_TB_MAX * sizeof(struct caly_token_bucket), rate_state_tb_len);
 
 /* The statistics enum must fit in the __u32 that carries it in struct event
  * and must leave room to grow inside a sanely sized per-CPU array. */

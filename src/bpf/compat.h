@@ -216,7 +216,7 @@
 /* --- bpf_ktime_get_boot_ns (5.7+) --------------------------------------- */
 /*
  * Deliberately NOT used. Every timestamp in the ABI (ban_entry.expiry_ns,
- * token_bucket.last_refill_ns, ...) is bpf_ktime_get_ns(). Mixing the two
+ * caly_token_bucket.last_refill_ns, ...) is bpf_ktime_get_ns(). Mixing the two
  * clocks would make bans expire at boot-time offsets. Userspace reads
  * CLOCK_MONOTONIC to stay in the same time base.
  */

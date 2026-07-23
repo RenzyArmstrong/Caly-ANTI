@@ -81,7 +81,13 @@ CLI      := $(BUILD)/calyctl
 CLI_SRC  := cli/calyctl
 BPF_OBJ  := $(BUILD)/calyanti.bpf.o
 
-USER_SRCS := $(sort $(wildcard $(USERDIR)/*.c))
+# config.c / maps.c / ipc.c are a second, parallel map+config implementation
+# (their own struct caly_cidr, their own caly_now_ns/caly_icmp_policy_set) that
+# the daemon does not use and that would clash at link time with util.c/loader.c.
+# The daemon reaches every map through loader.c (caly_bpf) + ctl.c, so these are
+# excluded from the build. See docs/ARCHITECTURE.md.
+USER_EXCLUDE := $(USERDIR)/config.c $(USERDIR)/maps.c $(USERDIR)/ipc.c
+USER_SRCS := $(filter-out $(USER_EXCLUDE),$(sort $(wildcard $(USERDIR)/*.c)))
 USER_OBJS := $(patsubst $(USERDIR)/%.c,$(BUILD)/user/%.o,$(USER_SRCS))
 USER_DEPS := $(USER_OBJS:.o=.d)
 

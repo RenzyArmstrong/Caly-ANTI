@@ -4,8 +4,8 @@
  * src/bpf/common.h - THE authoritative ABI contract.
  *
  * This header is included VERBATIM by:
- *   - the BPF dataplane objects  (src/bpf/*.bpf.c)
- *   - the userspace loader/daemon (src/user/*.c)
+ *   - the BPF dataplane objects  (the src/bpf .bpf.c files)
+ *   - the userspace loader/daemon (the src/user .c files)
  *   - the CLI / stats reporter
  *
  * Everything that crosses the kernel/userspace boundary is defined here and
@@ -95,7 +95,7 @@
 
 /* Ethertypes / protocol numbers. Redefining these locally rather than relying
  * on vmlinux.h keeps the header self-contained on both sides of the boundary
- * (vmlinux.h carries types, not the ETH_P_*/IPPROTO_* macros). */
+ * (vmlinux.h carries types, not the ETH_P and IPPROTO macros). */
 #define CALY_ETH_P_IP           0x0800
 #define CALY_ETH_P_IPV6         0x86DD
 #define CALY_ETH_P_ARP          0x0806

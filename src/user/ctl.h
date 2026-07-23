@@ -50,8 +50,7 @@ struct event;
  * dispatch call.  Nothing here is copied or freed by the ctl module.
  */
 struct caly_ctl_env {
-	struct caly_maps       *maps;    /* fds adopted from the loaded object */
-	struct caly_bpf        *bpf;     /* config read/write + map counts     */
+	struct caly_bpf        *bpf;     /* the loaded object: maps + config   */
 	struct fw_config       *cfg;     /* the daemon's authoritative config  */
 
 	__u32                  *base_mode;   /* operator-selected base mode    */

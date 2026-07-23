@@ -35,13 +35,17 @@
 #include "loader.h"
 #include "log.h"
 #include "util.h"
-#include "maps.h"
 #include "ctl.h"
 
 /* Maximum live "subscribe" connections streaming events at once. Bounded so a
  * flood of subscribers cannot exhaust descriptors; the control socket is
  * root-only, so this is belt-and-braces rather than a real threat surface. */
 #define CALY_CTL_MAX_SUBS  32
+
+/* struct caly_daemon is defined further down; the two forward declarations
+ * below reference it by pointer, so it must be an announced (incomplete) tag
+ * before them or the parameter type binds to the wrong scope. */
+struct caly_daemon;
 
 /* Defined with the control-socket code below; caly_on_event() (above it) needs
  * to be able to evict a subscriber whose socket has died mid-write. */
@@ -173,8 +177,6 @@ struct caly_daemon {
 	__u64 events_lost;
 
 	/* control-socket JSON plane (see ctl.c) */
-	struct caly_maps ctl_maps;    /* rich map ops over the loader's fds   */
-	int   ctl_maps_ready;
 	int   sub_fds[CALY_CTL_MAX_SUBS];  /* live event subscribers          */
 	int   nsub;
 	__u64 start_wall_ns;          /* CLOCK_REALTIME at startup, for uptime */
@@ -1372,32 +1374,12 @@ static int caly_ctl_open(struct caly_daemon *d)
 }
 
 /*
- * Adopt the loader's already-open map fds into a struct caly_maps so the
- * control plane can use the rich per-map operations in maps.c. The two map-id
- * enums (CALY_MID_* in loader.h and CALY_MAP_ID_* in maps.h) are defined in the
- * same order with the same values, so the index carries straight across. The
- * fds stay owned by struct caly_bpf: we pass owned=0 so caly_maps_close() never
- * closes them.
+ * Fill in the control-plane environment. ctl.c reaches the maps through the
+ * loader's caly_bpf handle (raw libbpf), so nothing to adopt here.
  */
-static void caly_ctl_maps_setup(struct caly_daemon *d)
-{
-	int i;
-
-	if (d->ctl_maps_ready)
-		return;
-	caly_maps_init(&d->ctl_maps);
-	for (i = 0; i < CALY_MID_MAX; i++) {
-		if (d->bpf.map_fd[i] >= 0)
-			(void)caly_maps_set_fd(&d->ctl_maps, i,
-					       d->bpf.map_fd[i], 0);
-	}
-	d->ctl_maps_ready = 1;
-}
-
 static void caly_ctl_build_env(struct caly_daemon *d, struct caly_ctl_env *env)
 {
 	memset(env, 0, sizeof(*env));
-	env->maps           = &d->ctl_maps;
 	env->bpf            = &d->bpf;
 	env->cfg            = &d->cfg;
 	env->base_mode      = &d->base_mode;
@@ -1519,7 +1501,8 @@ static void caly_ctl_accept(struct caly_daemon *d)
 			break;
 		}
 		(void)caly_set_cloexec(cfd);
-		if (!d->ctl_maps_ready) {
+		if (d->bpf.obj == NULL && d->bpf.map_fd[CALY_MID_CONFIG] < 0) {
+			/* not loaded yet; nothing the control plane can do */
 			(void)close(cfd);
 			continue;
 		}
@@ -1813,13 +1796,6 @@ static void caly_teardown(struct caly_daemon *d, int do_unpin)
 	for (i = 0; i < d->nsub; i++)
 		(void)close(d->sub_fds[i]);
 	d->nsub = 0;
-
-	/* Release the control-plane map handle. owned==0 for every fd, so this
-	 * frees only the shadow vectors; the loader still owns the fds. */
-	if (d->ctl_maps_ready) {
-		caly_maps_close(&d->ctl_maps);
-		d->ctl_maps_ready = 0;
-	}
 
 	if (d->events != NULL) {
 		caly_events_close(d->events);
@@ -2178,10 +2154,6 @@ static int caly_startup(struct caly_daemon *d)
 		return -1;
 	}
 
-	/* The maps now exist and their fds are live; expose them to the control
-	 * plane so calyctl can ban/allow/dump. */
-	caly_ctl_maps_setup(d);
-
 	if (caly_apply_pending(d) != 0)
 		caly_warn("some configuration list directives could not be "
 			  "applied; continuing");
@@ -2445,7 +2417,6 @@ int main(int argc, char **argv)
 	d->mode_cli = -1;
 	d->use_syslog = 1;
 	d->nsub = 0;
-	d->ctl_maps_ready = 0;
 	d->start_wall_ns = caly_wall_ns();
 	{
 		int i;

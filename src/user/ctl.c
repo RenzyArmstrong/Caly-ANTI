@@ -6,10 +6,11 @@
  * over the SOCK_STREAM control socket, spoken by cli/calyctl and
  * watcher/calywatch.py.  See ctl.h for the wire format.
  *
- * This file is deliberately dependency-free beyond the project's own headers
- * and libc: a control socket that is root-only is still untrusted input, so it
- * carries its own small, bounded JSON parser rather than pulling in a library.
- * Nothing here blocks, allocates without checking, or trusts a length field.
+ * This module lives entirely in the daemon's own world (loader.h + util.h):
+ * it reaches the BPF maps through the loader's caly_bpf handle and raw libbpf
+ * syscalls, so it does not pull in the parallel maps.c/config.c layer. A
+ * root-only control socket is still untrusted input, so it carries its own
+ * small, bounded JSON parser rather than a library.
  */
 
 #ifndef CALY_USERSPACE
@@ -18,7 +19,6 @@
 
 #include "common.h"
 #include "loader.h"
-#include "maps.h"
 #include "util.h"
 #include "ctl.h"
 
@@ -29,10 +29,26 @@
 #include <string.h>
 
 #include <arpa/inet.h>
+#include <bpf/bpf.h>
+
+/* Family selector for the read/dump paths. */
+#define CTL_FAM_ANY  0u
+#define CTL_FAM_V4   CALY_UTIL_AF_INET
+#define CTL_FAM_V6   CALY_UTIL_AF_INET6
+
+/* Local set ids for allow/block/local (kept independent of any header). */
+#define CTL_SET_ALLOW  0
+#define CTL_SET_BLOCK  1
+#define CTL_SET_LOCAL  2
+
+/* Bounds for the generic map collector. Every key we iterate (u32, in6_key,
+ * lpm_key_v6, conn_key) fits in 64 bytes; every value (ban_entry, src_stats,
+ * conn_state, rule_meta) fits in 512. */
+#define CTL_KEY_MAX  64
+#define CTL_VAL_MAX  512
 
 /* -------------------------------------------------------------------------
- * enum caly_dataplane -> string (kept local so ctl.c needs nothing from the
- * daemon translation unit).
+ * enum caly_dataplane -> string (kept local so ctl.c needs nothing extra).
  * ------------------------------------------------------------------------- */
 static const char *ctl_dataplane_str(__u32 dp)
 {
@@ -48,7 +64,7 @@ static const char *ctl_dataplane_str(__u32 dp)
 }
 
 /* =========================================================================
- * sbuf: a growable output buffer.  Every append is bounds-checked and sets an
+ * sbuf: a growable output buffer. Every append is bounds-checked and sets an
  * error flag on allocation failure; the caller checks ->err once before it
  * writes, so no partial or oversized response is ever emitted.
  * ========================================================================= */
@@ -60,12 +76,8 @@ struct sbuf {
 	int    err;
 };
 
-/* Hard ceiling on any single response, so a pathological dump (hundreds of
- * thousands of prefixes) cannot make the daemon allocate without bound. Kept
- * below the 8 MiB line limit the clients enforce on their read side, so an
- * over-large dump is reported as a clean "response too large" error rather than
- * a torn connection. Narrow the query (or use a direct/export path) for very
- * large lists. */
+/* Hard ceiling on any single response, kept below the 8 MiB line limit the
+ * clients enforce, so an over-large dump is a clean error not a torn socket. */
 #define CTL_RESP_MAX  (7u * 1024u * 1024u)
 
 static void sb_init(struct sbuf *s)
@@ -95,7 +107,7 @@ static int sb_reserve(struct sbuf *s, size_t extra)
 		s->err = 1;
 		return -1;
 	}
-	need = s->len + extra + 1;   /* +1 keeps room for a trailing NUL */
+	need = s->len + extra + 1;
 	if (need <= s->cap)
 		return 0;
 	if (s->cap == 0)
@@ -153,7 +165,7 @@ static void sb_i64(struct sbuf *s, long long v)
 		sb_write(s, tmp, (size_t)n);
 }
 
-/* Append a JSON string literal: quotes, escaping ", \\ and control chars. */
+/* Append a JSON string literal: quotes, escaping " backslash and controls. */
 static void sb_jstr(struct sbuf *s, const char *p, size_t n)
 {
 	size_t i;
@@ -191,7 +203,6 @@ static void sb_jstrz(struct sbuf *s, const char *p)
 	sb_jstr(s, p, strlen(p));
 }
 
-/* "key":  -  a JSON object member key followed by a colon. */
 static void sb_key(struct sbuf *s, const char *k)
 {
 	sb_jstrz(s, k);
@@ -200,11 +211,6 @@ static void sb_key(struct sbuf *s, const char *k)
 
 /* =========================================================================
  * A small, bounded JSON parser producing a flat DOM in a fixed arena.
- *
- * It parses in place into a private, mutable, NUL-terminated copy of the
- * request line; string values are unescaped in place (unescaping only ever
- * shrinks).  Depth and node count are hard-capped so a hostile nesting cannot
- * exhaust the stack or memory.
  * ========================================================================= */
 
 #define J_MAX_NODES  4096
@@ -214,15 +220,15 @@ enum jkind { JK_NULL, JK_BOOL, JK_NUM, JK_STR, JK_ARR, JK_OBJ };
 
 struct jnode {
 	enum jkind kind;
-	int        bval;      /* JK_BOOL                                    */
-	__u64      num;       /* JK_NUM magnitude                           */
-	int        neg;       /* JK_NUM sign                                */
-	char      *str;       /* JK_STR value (into the mutable copy)       */
+	int        bval;
+	__u64      num;
+	int        neg;
+	char      *str;
 	size_t     slen;
-	char      *key;       /* member key when this node is an obj child  */
+	char      *key;
 	size_t     klen;
-	int        child;     /* first child index, or -1                   */
-	int        next;      /* next sibling index, or -1                  */
+	int        child;
+	int        next;
 };
 
 struct jparse {
@@ -267,11 +273,9 @@ static int j_alloc(struct jparse *jp)
 
 static int j_parse_value(struct jparse *jp);
 
-/* Parse a JSON string body (cursor is just past the opening quote). Unescapes
- * in place; on success *out points into the buffer and *len is its length. */
 static int j_parse_string_raw(struct jparse *jp, char **out, size_t *len)
 {
-	char *w = jp->cur;   /* write cursor for in-place unescape */
+	char *w = jp->cur;
 
 	*out = jp->cur;
 	while (jp->cur < jp->end) {
@@ -279,7 +283,7 @@ static int j_parse_string_raw(struct jparse *jp, char **out, size_t *len)
 
 		if (c == '"') {
 			*len = (size_t)(w - *out);
-			jp->cur++;          /* consume closing quote */
+			jp->cur++;
 			return 0;
 		}
 		if (c == '\\') {
@@ -296,8 +300,6 @@ static int j_parse_string_raw(struct jparse *jp, char **out, size_t *len)
 			case 'r':  *w++ = '\r'; break;
 			case 't':  *w++ = '\t'; break;
 			case 'u': {
-				/* \uXXXX -> UTF-8. Enough for correctness; the
-				 * control protocol is ASCII in practice. */
 				unsigned int cp = 0;
 				int i;
 
@@ -305,17 +307,17 @@ static int j_parse_string_raw(struct jparse *jp, char **out, size_t *len)
 					return -1;
 				for (i = 1; i <= 4; i++) {
 					char h = jp->cur[i];
-					int  d;
+					int  dg;
 
 					if (h >= '0' && h <= '9')
-						d = h - '0';
+						dg = h - '0';
 					else if (h >= 'a' && h <= 'f')
-						d = h - 'a' + 10;
+						dg = h - 'a' + 10;
 					else if (h >= 'A' && h <= 'F')
-						d = h - 'A' + 10;
+						dg = h - 'A' + 10;
 					else
 						return -1;
-					cp = (cp << 4) | (unsigned int)d;
+					cp = (cp << 4) | (unsigned int)dg;
 				}
 				jp->cur += 4;
 				if (cp < 0x80) {
@@ -335,7 +337,7 @@ static int j_parse_string_raw(struct jparse *jp, char **out, size_t *len)
 			}
 			jp->cur++;
 		} else if (c < 0x20) {
-			return -1;          /* raw control char is illegal */
+			return -1;
 		} else {
 			if (w != jp->cur)
 				*w = (char)c;
@@ -343,14 +345,14 @@ static int j_parse_string_raw(struct jparse *jp, char **out, size_t *len)
 			jp->cur++;
 		}
 	}
-	return -1;                           /* unterminated string */
+	return -1;
 }
 
 static int j_parse_string(struct jparse *jp)
 {
 	int idx;
 
-	jp->cur++;                            /* consume opening quote */
+	jp->cur++;
 	idx = j_alloc(jp);
 	if (idx < 0)
 		return -1;
@@ -377,18 +379,14 @@ static int j_parse_number(struct jparse *jp)
 	if (jp->cur >= jp->end || *jp->cur < '0' || *jp->cur > '9')
 		return -1;
 	while (jp->cur < jp->end && *jp->cur >= '0' && *jp->cur <= '9') {
-		unsigned int d = (unsigned int)(*jp->cur - '0');
+		unsigned int dg = (unsigned int)(*jp->cur - '0');
 
-		/* Saturate rather than overflow; no legitimate field needs
-		 * more than 2^64-1 and a hostile huge value just clamps. */
-		if (v > (0xFFFFFFFFFFFFFFFFULL - d) / 10ULL)
+		if (v > (0xFFFFFFFFFFFFFFFFULL - dg) / 10ULL)
 			v = 0xFFFFFFFFFFFFFFFFULL;
 		else
-			v = v * 10ULL + d;
+			v = v * 10ULL + dg;
 		jp->cur++;
 	}
-	/* Tolerate but discard a fractional / exponent tail: no control field
-	 * is fractional, and rejecting would only make clients brittle. */
 	while (jp->cur < jp->end) {
 		char c = *jp->cur;
 
@@ -424,7 +422,7 @@ static int j_parse_array(struct jparse *jp)
 {
 	int idx, last = -1;
 
-	jp->cur++;                            /* consume '[' */
+	jp->cur++;
 	idx = j_alloc(jp);
 	if (idx < 0)
 		return -1;
@@ -469,7 +467,7 @@ static int j_parse_object(struct jparse *jp)
 {
 	int idx, last = -1;
 
-	jp->cur++;                            /* consume '{' */
+	jp->cur++;
 	idx = j_alloc(jp);
 	if (idx < 0)
 		return -1;
@@ -540,8 +538,6 @@ static int j_parse_value(struct jparse *jp)
 	}
 }
 
-/* --- accessors --- */
-
 static int j_obj_get(struct jparse *jp, int obj, const char *key)
 {
 	int    c;
@@ -567,7 +563,6 @@ static const char *j_as_str(struct jparse *jp, int idx, size_t *len)
 	return jp->nodes[idx].str;
 }
 
-/* A NUL-terminated copy of a string node into `buf`. Returns 0 on success. */
 static int j_str_dup(struct jparse *jp, int idx, char *buf, size_t cap)
 {
 	size_t      len;
@@ -580,7 +575,6 @@ static int j_str_dup(struct jparse *jp, int idx, char *buf, size_t cap)
 	return 0;
 }
 
-/* Accept a JSON number or a numeric string. Returns 0 and sets *out. */
 static int j_as_u64(struct jparse *jp, int idx, __u64 *out)
 {
 	if (idx < 0)
@@ -621,37 +615,160 @@ static int j_as_bool(struct jparse *jp, int idx, int *out)
 }
 
 /* =========================================================================
- * Response helpers
+ * Raw BPF map access (the daemon's world: fds from caly_bpf_map_fd).
  * ========================================================================= */
 
-static void ctl_send_raw(int fd, const char *buf, size_t len)
+static int ctl_fd(const struct caly_bpf *b, int id)
 {
-	(void)caly_write_all(fd, buf, len);
+	return caly_bpf_map_fd(b, id);
 }
 
-static void ctl_send_err(int fd, __u64 id, const char *code, const char *msg)
+/* Collect every (key,value) pair from a hash/LPM map into malloc'd byte
+ * arrays. Returns the count (>=0) or -1. Caller frees *keys and *vals. */
+static long ctl_map_collect(int fd, size_t ksz, size_t vsz,
+			    unsigned char **keys, unsigned char **vals)
 {
-	struct sbuf s;
+	unsigned char curk[CTL_KEY_MAX], nextk[CTL_KEY_MAX], val[CTL_VAL_MAX];
+	unsigned char *kbuf = NULL, *vbuf = NULL;
+	size_t cap = 0, n = 0;
+	int have = 0;
 
-	sb_init(&s);
-	sb_puts(&s, "{\"id\":");
-	sb_u64(&s, id);
-	sb_puts(&s, ",\"ok\":false,\"error\":");
-	sb_jstrz(&s, msg ? msg : "error");
-	sb_puts(&s, ",\"code\":");
-	sb_jstrz(&s, code ? code : "error");
-	sb_puts(&s, "}\n");
-	if (!s.err)
-		ctl_send_raw(fd, s.buf, s.len);
-	sb_free(&s);
+	*keys = NULL;
+	*vals = NULL;
+	if (ksz == 0 || ksz > CTL_KEY_MAX || vsz == 0 || vsz > CTL_VAL_MAX)
+		return -1;
+	while (bpf_map_get_next_key(fd, have ? curk : NULL, nextk) == 0) {
+		if (bpf_map_lookup_elem(fd, nextk, val) == 0) {
+			if (n == cap) {
+				size_t nc = cap ? cap * 2 : 64;
+				unsigned char *nk = realloc(kbuf, nc * ksz);
+				unsigned char *nv;
+
+				if (!nk) {
+					free(kbuf);
+					free(vbuf);
+					return -1;
+				}
+				kbuf = nk;
+				nv = realloc(vbuf, nc * vsz);
+				if (!nv) {
+					free(kbuf);
+					free(vbuf);
+					return -1;
+				}
+				vbuf = nv;
+				cap = nc;
+			}
+			memcpy(kbuf + n * ksz, nextk, ksz);
+			memcpy(vbuf + n * vsz, val, vsz);
+			n++;
+		}
+		memcpy(curk, nextk, ksz);
+		have = 1;
+		if (n >= 2000000)   /* runaway guard */
+			break;
+	}
+	*keys = kbuf;
+	*vals = vbuf;
+	return (long)n;
+}
+
+static int ctl_ban_add(const struct caly_bpf *b, const struct caly_cidr *c,
+		       __u64 ttl, __u32 flags)
+{
+	__u64 now = caly_now_ns();
+	struct ban_entry e;
+	int fd;
+
+	memset(&e, 0, sizeof(e));
+	e.first_seen_ns = now;
+	e.last_hit_ns   = now;
+	e.cur_ttl_ns    = ttl;
+	e.flags         = flags;
+	e.offences      = 1;
+	e.reason        = STAT_DROP_TOTAL;
+	e.expiry_ns     = (flags & CALY_BAN_F_PERMANENT) ? 0 : now + ttl;
+
+	if (c->family == CALY_UTIL_AF_INET) {
+		__u32 k;
+
+		fd = ctl_fd(b, CALY_MID_BAN4);
+		if (fd < 0)
+			return -1;
+		memcpy(&k, c->addr, 4);
+		return bpf_map_update_elem(fd, &k, &e, BPF_ANY);
+	} else {
+		struct in6_key k;
+
+		fd = ctl_fd(b, CALY_MID_BAN6);
+		if (fd < 0)
+			return -1;
+		memcpy(k.a, c->addr, 16);
+		return bpf_map_update_elem(fd, &k, &e, BPF_ANY);
+	}
+}
+
+static int ctl_ban_del(const struct caly_bpf *b, const struct caly_cidr *c)
+{
+	int fd;
+
+	if (c->family == CALY_UTIL_AF_INET) {
+		__u32 k;
+
+		fd = ctl_fd(b, CALY_MID_BAN4);
+		if (fd < 0)
+			return -1;
+		memcpy(&k, c->addr, 4);
+		return bpf_map_delete_elem(fd, &k);
+	} else {
+		struct in6_key k;
+
+		fd = ctl_fd(b, CALY_MID_BAN6);
+		if (fd < 0)
+			return -1;
+		memcpy(k.a, c->addr, 16);
+		return bpf_map_delete_elem(fd, &k);
+	}
+}
+
+static int ctl_lpm_map_id(int set, int v6)
+{
+	switch (set) {
+	case CTL_SET_ALLOW: return v6 ? CALY_MID_ALLOW6 : CALY_MID_ALLOW4;
+	case CTL_SET_BLOCK: return v6 ? CALY_MID_BLOCK6 : CALY_MID_BLOCK4;
+	default:            return v6 ? CALY_MID_LOCAL6 : CALY_MID_LOCAL4;
+	}
+}
+
+static int ctl_set_del(const struct caly_bpf *b, int set,
+		       const struct caly_cidr *c)
+{
+	int v6 = (c->family == CALY_UTIL_AF_INET6);
+	int fd = ctl_fd(b, ctl_lpm_map_id(set, v6));
+
+	if (fd < 0)
+		return -1;
+	if (v6) {
+		struct lpm_key_v6 k;
+
+		memset(&k, 0, sizeof(k));
+		k.prefixlen = c->prefixlen;
+		memcpy(k.addr, c->addr, 16);
+		return bpf_map_delete_elem(fd, &k);
+	} else {
+		struct lpm_key_v4 k;
+
+		memset(&k, 0, sizeof(k));
+		k.prefixlen = c->prefixlen;
+		memcpy(k.addr, c->addr, 4);
+		return bpf_map_delete_elem(fd, &k);
+	}
 }
 
 /* =========================================================================
- * Argument decoding shared by the mutating commands
+ * CIDR argument helpers
  * ========================================================================= */
 
-/* Family from an arg that may be a number (4/6) or a string
- * (4/6/v4/v6/inet/inet6). Absent -> CALY_FAM_ANY. */
 static __u32 ctl_arg_family(struct jparse *jp, int args)
 {
 	int    idx = j_obj_get(jp, args, "family");
@@ -659,26 +776,25 @@ static __u32 ctl_arg_family(struct jparse *jp, int args)
 	char   buf[16];
 
 	if (idx < 0)
-		return CALY_FAM_ANY;
+		return CTL_FAM_ANY;
 	if (j_as_u64(jp, idx, &n) == 0) {
 		if (n == 4)
-			return CALY_FAM_V4;
+			return CTL_FAM_V4;
 		if (n == 6)
-			return CALY_FAM_V6;
-		return CALY_FAM_ANY;
+			return CTL_FAM_V6;
+		return CTL_FAM_ANY;
 	}
 	if (j_str_dup(jp, idx, buf, sizeof(buf)) == 0) {
 		if (caly_strcaseeq(buf, "4") || caly_strcaseeq(buf, "v4") ||
 		    caly_strcaseeq(buf, "inet") || caly_strcaseeq(buf, "ipv4"))
-			return CALY_FAM_V4;
+			return CTL_FAM_V4;
 		if (caly_strcaseeq(buf, "6") || caly_strcaseeq(buf, "v6") ||
 		    caly_strcaseeq(buf, "inet6") || caly_strcaseeq(buf, "ipv6"))
-			return CALY_FAM_V6;
+			return CTL_FAM_V6;
 	}
-	return CALY_FAM_ANY;
+	return CTL_FAM_ANY;
 }
 
-/* Required CIDR arg. On failure sets *code/*msg and returns -1. */
 static int ctl_arg_cidr(struct jparse *jp, int args, const char *key,
 			struct caly_cidr *out, const char **code,
 			const char **msg)
@@ -686,8 +802,7 @@ static int ctl_arg_cidr(struct jparse *jp, int args, const char *key,
 	int  idx = j_obj_get(jp, args, key);
 	char buf[CALY_CIDR_STRLEN];
 
-	/* calyctl spells the address "cidr"; calywatch spells it "addr". Accept
-	 * either so both clients drive the same daemon without translation. */
+	/* calyctl spells the address "cidr"; calywatch spells it "addr". */
 	if (idx < 0)
 		idx = j_obj_get(jp, args, "addr");
 	if (idx < 0)
@@ -718,10 +833,27 @@ static int ctl_is_host(const struct caly_cidr *c)
 	return c->prefixlen == 128;
 }
 
+static void ctl_emit_cidr(struct sbuf *d, const struct caly_cidr *c)
+{
+	char buf[CALY_CIDR_STRLEN];
+
+	if (caly_format_cidr(c, buf, sizeof(buf)) != 0)
+		(void)caly_strlcpy(buf, "?", sizeof(buf));
+	sb_jstrz(d, buf);
+}
+
+static void ctl_emit_addr(struct sbuf *d, __u32 family, const __u8 *addr)
+{
+	char buf[CALY_ADDR_STRLEN];
+
+	if (caly_format_ip(family, addr, buf, sizeof(buf)) != 0)
+		(void)caly_strlcpy(buf, "?", sizeof(buf));
+	sb_jstrz(d, buf);
+}
+
 /* =========================================================================
- * Command handlers.  Each appends the "data" VALUE (an object or array) to
- * `d`, and returns 0 on success.  On failure it returns -1 with *code/*msg
- * set, and the caller turns that into an error response.
+ * Command handlers. Each appends the "data" VALUE to `d` and returns 0, or
+ * returns -1 with *code/*msg set for an error response.
  * ========================================================================= */
 
 static int h_ping(struct sbuf *d)
@@ -758,53 +890,23 @@ static void ctl_emit_config(const struct fw_config *c, struct sbuf *d)
 	sb_key(d, "global_bps_lo");      sb_u64(d, c->global_bps_lo);      sb_putc(d, ',');
 	sb_key(d, "global_syn_pps_hi");  sb_u64(d, c->global_syn_pps_hi);  sb_putc(d, ',');
 	sb_key(d, "global_syn_pps_lo");  sb_u64(d, c->global_syn_pps_lo);  sb_putc(d, ',');
-	sb_key(d, "global_newconn_pps_hi"); sb_u64(d, c->global_newconn_pps_hi); sb_putc(d, ',');
-	sb_key(d, "global_newconn_pps_lo"); sb_u64(d, c->global_newconn_pps_lo); sb_putc(d, ',');
 	sb_key(d, "attack_dwell_ns");    sb_u64(d, c->attack_dwell_ns);    sb_putc(d, ',');
 	sb_key(d, "syn_fallback_pps");   sb_u64(d, c->syn_fallback_pps);   sb_putc(d, ',');
 
 	sb_key(d, "ban_ttl_base_ns");    sb_u64(d, c->ban_ttl_base_ns);    sb_putc(d, ',');
 	sb_key(d, "ban_ttl_max_ns");     sb_u64(d, c->ban_ttl_max_ns);     sb_putc(d, ',');
-	sb_key(d, "ban_ttl_scan_ns");    sb_u64(d, c->ban_ttl_scan_ns);    sb_putc(d, ',');
-	sb_key(d, "ban_ttl_amp_ns");     sb_u64(d, c->ban_ttl_amp_ns);     sb_putc(d, ',');
 	sb_key(d, "strike_window_ns");   sb_u64(d, c->strike_window_ns);   sb_putc(d, ',');
 	sb_key(d, "scan_window_ns");     sb_u64(d, c->scan_window_ns);     sb_putc(d, ',');
 
-	sb_key(d, "ct_tcp_syn_ns");      sb_u64(d, c->ct_tcp_syn_ns);      sb_putc(d, ',');
 	sb_key(d, "ct_tcp_est_ns");      sb_u64(d, c->ct_tcp_est_ns);      sb_putc(d, ',');
-	sb_key(d, "ct_tcp_fin_ns");      sb_u64(d, c->ct_tcp_fin_ns);      sb_putc(d, ',');
 	sb_key(d, "ct_udp_ns");          sb_u64(d, c->ct_udp_ns);          sb_putc(d, ',');
-	sb_key(d, "ct_udp_stream_ns");   sb_u64(d, c->ct_udp_stream_ns);   sb_putc(d, ',');
-	sb_key(d, "ct_icmp_ns");         sb_u64(d, c->ct_icmp_ns);         sb_putc(d, ',');
-	sb_key(d, "ct_generic_ns");      sb_u64(d, c->ct_generic_ns);      sb_putc(d, ',');
-
-	sb_key(d, "rate_idle_ns");       sb_u64(d, c->rate_idle_ns);       sb_putc(d, ',');
-	sb_key(d, "scan_idle_ns");       sb_u64(d, c->scan_idle_ns);       sb_putc(d, ',');
-	sb_key(d, "srcstat_idle_ns");    sb_u64(d, c->srcstat_idle_ns);    sb_putc(d, ',');
 
 	sb_key(d, "mode");               sb_u64(d, c->mode);               sb_putc(d, ',');
-	sb_key(d, "default_zone");       sb_u64(d, c->default_zone);       sb_putc(d, ',');
 	sb_key(d, "strike_limit");       sb_u64(d, c->strike_limit);       sb_putc(d, ',');
-	sb_key(d, "ban_escalate_num");   sb_u64(d, c->ban_escalate_num);   sb_putc(d, ',');
-	sb_key(d, "ban_escalate_den");   sb_u64(d, c->ban_escalate_den);   sb_putc(d, ',');
 	sb_key(d, "scan_port_threshold"); sb_u64(d, c->scan_port_threshold); sb_putc(d, ',');
-	sb_key(d, "icmp_max_payload");   sb_u64(d, c->icmp_max_payload);   sb_putc(d, ',');
-	sb_key(d, "icmp6_max_payload");  sb_u64(d, c->icmp6_max_payload);  sb_putc(d, ',');
-	sb_key(d, "frag_min_bytes");     sb_u64(d, c->frag_min_bytes);     sb_putc(d, ',');
-	sb_key(d, "ip_min_ttl");         sb_u64(d, c->ip_min_ttl);         sb_putc(d, ',');
-	sb_key(d, "vlan_max_depth");     sb_u64(d, c->vlan_max_depth);     sb_putc(d, ',');
-	sb_key(d, "ip6_ext_max");        sb_u64(d, c->ip6_ext_max);        sb_putc(d, ',');
-	sb_key(d, "tunnel_max_depth");   sb_u64(d, c->tunnel_max_depth);   sb_putc(d, ',');
-	sb_key(d, "tcp_min_doff");       sb_u64(d, c->tcp_min_doff);       sb_putc(d, ',');
 	sb_key(d, "log_sample_rate");    sb_u64(d, c->log_sample_rate);    sb_putc(d, ',');
-	sb_key(d, "log_max_pps");        sb_u64(d, c->log_max_pps);        sb_putc(d, ',');
 	sb_key(d, "log_level");          sb_u64(d, c->log_level);          sb_putc(d, ',');
-	sb_key(d, "gc_interval_ms");     sb_u64(d, c->gc_interval_ms);     sb_putc(d, ',');
-	sb_key(d, "gc_batch");           sb_u64(d, c->gc_batch);           sb_putc(d, ',');
-	sb_key(d, "poll_interval_ms");   sb_u64(d, c->poll_interval_ms);   sb_putc(d, ',');
-	sb_key(d, "stats_interval_ms");  sb_u64(d, c->stats_interval_ms);  sb_putc(d, ',');
 	sb_key(d, "dataplane_pref");     sb_u64(d, c->dataplane_pref);     sb_putc(d, ',');
-	sb_key(d, "xdp_attach_pref");    sb_u64(d, c->xdp_attach_pref);    sb_putc(d, ',');
 
 	sb_key(d, "mgmt_tcp_ports"); sb_putc(d, '[');
 	for (i = 0; i < (int)c->mgmt_tcp_count && i < CALY_MGMT_PORTS_MAX; i++) {
@@ -846,7 +948,6 @@ static int h_status(const struct caly_ctl_env *env, struct sbuf *d)
 	sb_key(d, "events_seen"); sb_u64(d, env->events_seen ? *env->events_seen : 0); sb_putc(d, ',');
 	sb_key(d, "events_lost"); sb_u64(d, env->events_lost ? *env->events_lost : 0); sb_putc(d, ',');
 
-	/* interfaces */
 	sb_key(d, "interfaces"); sb_putc(d, '[');
 	for (i = 0; i < env->nlink; i++) {
 		const struct caly_link *l = &env->links[i];
@@ -868,7 +969,6 @@ static int h_status(const struct caly_ctl_env *env, struct sbuf *d)
 	sb_key(d, "dataplane"); sb_jstrz(d, ctl_dataplane_str(best_dp)); sb_putc(d, ',');
 	sb_key(d, "xdp_mode");  sb_jstrz(d, ctl_dataplane_str(best_dp)); sb_putc(d, ',');
 
-	/* counts */
 	sb_key(d, "counts"); sb_putc(d, '{');
 	sb_key(d, "bans");  sb_u64(d, ctl_count(env->bpf, CALY_MID_BAN4) +
 					ctl_count(env->bpf, CALY_MID_BAN6)); sb_putc(d, ',');
@@ -894,7 +994,7 @@ static int h_stats(const struct caly_ctl_env *env, struct sbuf *d,
 		   const char **code, const char **msg)
 {
 	__u64 *pkts, *bytes, gauges[CALY_G_MAX];
-	int    i, rc;
+	int    i;
 
 	pkts = calloc(STAT_MAX, sizeof(*pkts));
 	bytes = calloc(STAT_MAX, sizeof(*bytes));
@@ -905,8 +1005,7 @@ static int h_stats(const struct caly_ctl_env *env, struct sbuf *d,
 		*msg  = "out of memory";
 		return -1;
 	}
-	rc = caly_stats_read(env->maps, pkts, bytes, STAT_MAX);
-	if (rc != 0) {
+	if (caly_bpf_read_stats(env->bpf, pkts, bytes, STAT_MAX) != 0) {
 		free(pkts);
 		free(bytes);
 		*code = "internal";
@@ -914,7 +1013,7 @@ static int h_stats(const struct caly_ctl_env *env, struct sbuf *d,
 		return -1;
 	}
 	memset(gauges, 0, sizeof(gauges));
-	(void)caly_gauges_read(env->maps, gauges, CALY_G_MAX);
+	(void)caly_bpf_read_gauges(env->bpf, gauges, CALY_G_MAX);
 
 	sb_putc(d, '{');
 	sb_key(d, "ts_ns"); sb_u64(d, caly_wall_ns()); sb_putc(d, ',');
@@ -942,35 +1041,84 @@ static int h_stats(const struct caly_ctl_env *env, struct sbuf *d,
 	return 0;
 }
 
-static void ctl_emit_addr(struct sbuf *d, const struct caly_cidr *c)
-{
-	char buf[CALY_CIDR_STRLEN];
+/* --- top talkers ------------------------------------------------------- */
 
-	if (caly_format_cidr(c, buf, sizeof(buf)) != 0)
-		(void)caly_strlcpy(buf, "?", sizeof(buf));
-	sb_jstrz(d, buf);
+struct ctl_top_row {
+	__u32            family;
+	__u8             addr[16];
+	struct src_stats st;
+};
+
+static int ctl_top_sort_field;   /* single-threaded daemon; safe file scope */
+
+static int ctl_top_cmp(const void *a, const void *b)
+{
+	const struct ctl_top_row *x = a;
+	const struct ctl_top_row *y = b;
+	__u64 xa, ya;
+
+	switch (ctl_top_sort_field) {
+	case 1: xa = x->st.bytes;         ya = y->st.bytes;         break;
+	case 2: xa = x->st.drops;         ya = y->st.drops;         break;
+	case 3: xa = x->st.drop_bytes;    ya = y->st.drop_bytes;    break;
+	case 4: xa = x->st.last_seen_ns;  ya = y->st.last_seen_ns;  break;
+	default: xa = x->st.packets;      ya = y->st.packets;       break;
+	}
+	if (xa < ya) return 1;   /* descending */
+	if (xa > ya) return -1;
+	return 0;
 }
 
-static void ctl_emit_addr_only(struct sbuf *d, __u32 family, const __u8 *addr)
+static int ctl_top_gather(const struct caly_bpf *b, int mapid, int v6,
+			  struct ctl_top_row **rows, size_t *n, size_t *cap)
 {
-	char buf[CALY_ADDR_STRLEN];
+	unsigned char *keys = NULL, *vals = NULL;
+	size_t ksz = v6 ? sizeof(struct in6_key) : sizeof(__u32);
+	long cnt, j;
+	int fd = ctl_fd(b, mapid);
 
-	if (caly_format_ip(family, addr, buf, sizeof(buf)) != 0)
-		(void)caly_strlcpy(buf, "?", sizeof(buf));
-	sb_jstrz(d, buf);
+	if (fd < 0)
+		return 0;
+	cnt = ctl_map_collect(fd, ksz, sizeof(struct src_stats), &keys, &vals);
+	if (cnt < 0)
+		return -1;
+	for (j = 0; j < cnt; j++) {
+		struct ctl_top_row *r;
+
+		if (*n == *cap) {
+			size_t nc = *cap ? *cap * 2 : 64;
+			struct ctl_top_row *nr = realloc(*rows, nc * sizeof(*nr));
+
+			if (!nr) {
+				free(keys);
+				free(vals);
+				return -1;
+			}
+			*rows = nr;
+			*cap = nc;
+		}
+		r = &(*rows)[*n];
+		memset(r, 0, sizeof(*r));
+		r->family = v6 ? CALY_UTIL_AF_INET6 : CALY_UTIL_AF_INET;
+		memcpy(r->addr, keys + (size_t)j * ksz, v6 ? 16 : 4);
+		memcpy(&r->st, vals + (size_t)j * sizeof(struct src_stats),
+		       sizeof(struct src_stats));
+		(*n)++;
+	}
+	free(keys);
+	free(vals);
+	return 0;
 }
 
 static int h_top(const struct caly_ctl_env *env, struct sbuf *d,
 		 struct jparse *jp, int args, const char **code,
 		 const char **msg)
 {
-	struct caly_top_entry *rows = NULL;
-	size_t  n = 0, i;
-	__u64   limit = 20;
-	__u32   family = ctl_arg_family(jp, args);
-	int     sort = CALY_TOP_BY_PKTS;
-	int     idx;
-	int     rc;
+	struct ctl_top_row *rows = NULL;
+	size_t n = 0, cap = 0, i;
+	__u64  limit = 20;
+	__u32  fam = ctl_arg_family(jp, args);
+	int    idx;
 
 	idx = j_obj_get(jp, args, "n");
 	if (idx >= 0)
@@ -978,48 +1126,156 @@ static int h_top(const struct caly_ctl_env *env, struct sbuf *d,
 	if (limit == 0 || limit > 100000)
 		limit = 100000;
 
+	ctl_top_sort_field = 0;
 	idx = j_obj_get(jp, args, "sort");
 	if (idx >= 0) {
-		char sb[16];
+		char sbuf[16];
 
-		if (j_str_dup(jp, idx, sb, sizeof(sb)) == 0) {
-			if (caly_strcaseeq(sb, "bytes"))
-				sort = CALY_TOP_BY_BYTES;
-			else if (caly_strcaseeq(sb, "drops"))
-				sort = CALY_TOP_BY_DROPS;
-			else if (caly_strcaseeq(sb, "drop_bytes"))
-				sort = CALY_TOP_BY_DROP_BYTES;
-			else if (caly_strcaseeq(sb, "last_seen"))
-				sort = CALY_TOP_BY_LAST_SEEN;
+		if (j_str_dup(jp, idx, sbuf, sizeof(sbuf)) == 0) {
+			if (caly_strcaseeq(sbuf, "bytes"))
+				ctl_top_sort_field = 1;
+			else if (caly_strcaseeq(sbuf, "drops"))
+				ctl_top_sort_field = 2;
+			else if (caly_strcaseeq(sbuf, "drop_bytes"))
+				ctl_top_sort_field = 3;
+			else if (caly_strcaseeq(sbuf, "last_seen"))
+				ctl_top_sort_field = 4;
 		}
 	}
 
-	rc = caly_top_query(env->maps, family, sort, (size_t)limit, &rows, &n);
-	if (rc != 0) {
+	if (fam != CTL_FAM_V6 &&
+	    ctl_top_gather(env->bpf, CALY_MID_TOP4, 0, &rows, &n, &cap) != 0) {
+		free(rows);
 		*code = "internal";
 		*msg  = "top-talker query failed";
 		return -1;
 	}
+	if (fam != CTL_FAM_V4 &&
+	    ctl_top_gather(env->bpf, CALY_MID_TOP6, 1, &rows, &n, &cap) != 0) {
+		free(rows);
+		*code = "internal";
+		*msg  = "top-talker query failed";
+		return -1;
+	}
+	if (n > 1)
+		qsort(rows, n, sizeof(*rows), ctl_top_cmp);
+
 	sb_puts(d, "{\"sources\":[");
-	for (i = 0; i < n; i++) {
-		const struct caly_top_entry *e = &rows[i];
+	for (i = 0; i < n && i < limit; i++) {
+		const struct ctl_top_row *r = &rows[i];
 
 		if (i) sb_putc(d, ',');
 		sb_putc(d, '{');
-		sb_key(d, "addr"); ctl_emit_addr(d, &e->addr); sb_putc(d, ',');
-		sb_key(d, "family"); sb_u64(d, e->addr.family); sb_putc(d, ',');
-		sb_key(d, "packets"); sb_u64(d, e->stats.packets); sb_putc(d, ',');
-		sb_key(d, "bytes"); sb_u64(d, e->stats.bytes); sb_putc(d, ',');
-		sb_key(d, "drops"); sb_u64(d, e->stats.drops); sb_putc(d, ',');
-		sb_key(d, "drop_bytes"); sb_u64(d, e->stats.drop_bytes); sb_putc(d, ',');
-		sb_key(d, "first_seen_ns"); sb_u64(d, e->stats.first_seen_ns); sb_putc(d, ',');
-		sb_key(d, "last_seen_ns"); sb_u64(d, e->stats.last_seen_ns); sb_putc(d, ',');
-		sb_key(d, "last_reason"); sb_u64(d, e->stats.last_reason);
+		sb_key(d, "addr"); ctl_emit_addr(d, r->family, r->addr); sb_putc(d, ',');
+		sb_key(d, "family"); sb_u64(d, r->family); sb_putc(d, ',');
+		sb_key(d, "packets"); sb_u64(d, r->st.packets); sb_putc(d, ',');
+		sb_key(d, "bytes"); sb_u64(d, r->st.bytes); sb_putc(d, ',');
+		sb_key(d, "drops"); sb_u64(d, r->st.drops); sb_putc(d, ',');
+		sb_key(d, "drop_bytes"); sb_u64(d, r->st.drop_bytes); sb_putc(d, ',');
+		sb_key(d, "first_seen_ns"); sb_u64(d, r->st.first_seen_ns); sb_putc(d, ',');
+		sb_key(d, "last_seen_ns"); sb_u64(d, r->st.last_seen_ns); sb_putc(d, ',');
+		sb_key(d, "last_reason"); sb_u64(d, r->st.last_reason);
 		sb_putc(d, '}');
 	}
 	sb_puts(d, "]}");
 	free(rows);
 	return 0;
+}
+
+/* --- lists (bans / allow / block / local) ------------------------------ */
+
+static int h_list_bans(const struct caly_ctl_env *env, struct sbuf *d,
+		       int mapid, int v6, int first)
+{
+	unsigned char *keys = NULL, *vals = NULL;
+	size_t ksz = v6 ? sizeof(struct in6_key) : sizeof(__u32);
+	long cnt, j;
+	int fd = ctl_fd(env->bpf, mapid);
+
+	if (fd < 0)
+		return first;
+	cnt = ctl_map_collect(fd, ksz, sizeof(struct ban_entry), &keys, &vals);
+	if (cnt < 0)
+		return first;
+	for (j = 0; j < cnt; j++) {
+		const struct ban_entry *e =
+			(const struct ban_entry *)(vals + (size_t)j * sizeof(*e));
+		__u8 addr[16];
+
+		memset(addr, 0, sizeof(addr));
+		memcpy(addr, keys + (size_t)j * ksz, v6 ? 16 : 4);
+
+		if (!first) sb_putc(d, ',');
+		first = 0;
+		sb_putc(d, '{');
+		sb_key(d, "cidr");
+		ctl_emit_addr(d, v6 ? CALY_UTIL_AF_INET6 : CALY_UTIL_AF_INET, addr);
+		sb_putc(d, ',');
+		sb_key(d, "family"); sb_u64(d, v6 ? 6 : 4); sb_putc(d, ',');
+		sb_key(d, "expiry_ns"); sb_u64(d, e->expiry_ns); sb_putc(d, ',');
+		sb_key(d, "first_seen_ns"); sb_u64(d, e->first_seen_ns); sb_putc(d, ',');
+		sb_key(d, "last_hit_ns"); sb_u64(d, e->last_hit_ns); sb_putc(d, ',');
+		sb_key(d, "cur_ttl_ns"); sb_u64(d, e->cur_ttl_ns); sb_putc(d, ',');
+		sb_key(d, "hit_pkts"); sb_u64(d, e->hit_pkts); sb_putc(d, ',');
+		sb_key(d, "hit_bytes"); sb_u64(d, e->hit_bytes); sb_putc(d, ',');
+		sb_key(d, "reason"); sb_u64(d, e->reason); sb_putc(d, ',');
+		sb_key(d, "strikes"); sb_u64(d, e->strikes); sb_putc(d, ',');
+		sb_key(d, "offences"); sb_u64(d, e->offences); sb_putc(d, ',');
+		sb_key(d, "flags"); sb_u64(d, e->flags);
+		sb_putc(d, '}');
+	}
+	free(keys);
+	free(vals);
+	return first;
+}
+
+static int h_list_lpm(const struct caly_ctl_env *env, struct sbuf *d,
+		      int mapid, int v6, int first)
+{
+	unsigned char *keys = NULL, *vals = NULL;
+	size_t ksz = v6 ? sizeof(struct lpm_key_v6) : sizeof(struct lpm_key_v4);
+	long cnt, j;
+	int fd = ctl_fd(env->bpf, mapid);
+
+	if (fd < 0)
+		return first;
+	cnt = ctl_map_collect(fd, ksz, sizeof(struct rule_meta), &keys, &vals);
+	if (cnt < 0)
+		return first;
+	for (j = 0; j < cnt; j++) {
+		const struct rule_meta *m =
+			(const struct rule_meta *)(vals + (size_t)j * sizeof(*m));
+		struct caly_cidr c;
+
+		memset(&c, 0, sizeof(c));
+		if (v6) {
+			const struct lpm_key_v6 *k =
+				(const struct lpm_key_v6 *)(keys + (size_t)j * ksz);
+			c.family = CALY_UTIL_AF_INET6;
+			c.prefixlen = k->prefixlen;
+			memcpy(c.addr, k->addr, 16);
+		} else {
+			const struct lpm_key_v4 *k =
+				(const struct lpm_key_v4 *)(keys + (size_t)j * ksz);
+			c.family = CALY_UTIL_AF_INET;
+			c.prefixlen = k->prefixlen;
+			memcpy(c.addr, k->addr, 4);
+		}
+
+		if (!first) sb_putc(d, ',');
+		first = 0;
+		sb_putc(d, '{');
+		sb_key(d, "cidr"); ctl_emit_cidr(d, &c); sb_putc(d, ',');
+		sb_key(d, "family"); sb_u64(d, v6 ? 6 : 4); sb_putc(d, ',');
+		sb_key(d, "flags"); sb_u64(d, m->flags); sb_putc(d, ',');
+		sb_key(d, "tag"); sb_u64(d, m->tag); sb_putc(d, ',');
+		sb_key(d, "added_ns"); sb_u64(d, m->added_ns); sb_putc(d, ',');
+		sb_key(d, "hits"); sb_u64(d, m->hits);
+		sb_putc(d, '}');
+	}
+	free(keys);
+	free(vals);
+	return first;
 }
 
 static int h_list(const struct caly_ctl_env *env, struct sbuf *d,
@@ -1028,6 +1284,7 @@ static int h_list(const struct caly_ctl_env *env, struct sbuf *d,
 {
 	char what[16];
 	int  idx = j_obj_get(jp, args, "what");
+	int  first = 1;
 
 	if (idx < 0 || j_str_dup(jp, idx, what, sizeof(what)) != 0) {
 		*code = "bad_request";
@@ -1035,79 +1292,27 @@ static int h_list(const struct caly_ctl_env *env, struct sbuf *d,
 		return -1;
 	}
 
+	sb_puts(d, "{\"entries\":[");
 	if (caly_strcaseeq(what, "bans")) {
-		struct caly_ban_dump *rows = NULL;
-		size_t n = 0, i;
-
-		if (caly_ban_dump(env->maps, CALY_FAM_ANY, &rows, &n) != 0) {
-			*code = "internal";
-			*msg  = "ban dump failed";
-			return -1;
-		}
-		sb_puts(d, "{\"entries\":[");
-		for (i = 0; i < n; i++) {
-			const struct caly_ban_dump *b = &rows[i];
-
-			if (i) sb_putc(d, ',');
-			sb_putc(d, '{');
-			sb_key(d, "cidr"); ctl_emit_addr(d, &b->addr); sb_putc(d, ',');
-			sb_key(d, "family"); sb_u64(d, b->addr.family); sb_putc(d, ',');
-			sb_key(d, "expiry_ns"); sb_u64(d, b->entry.expiry_ns); sb_putc(d, ',');
-			sb_key(d, "first_seen_ns"); sb_u64(d, b->entry.first_seen_ns); sb_putc(d, ',');
-			sb_key(d, "last_hit_ns"); sb_u64(d, b->entry.last_hit_ns); sb_putc(d, ',');
-			sb_key(d, "cur_ttl_ns"); sb_u64(d, b->entry.cur_ttl_ns); sb_putc(d, ',');
-			sb_key(d, "hit_pkts"); sb_u64(d, b->entry.hit_pkts); sb_putc(d, ',');
-			sb_key(d, "hit_bytes"); sb_u64(d, b->entry.hit_bytes); sb_putc(d, ',');
-			sb_key(d, "reason"); sb_u64(d, b->entry.reason); sb_putc(d, ',');
-			sb_key(d, "strikes"); sb_u64(d, b->entry.strikes); sb_putc(d, ',');
-			sb_key(d, "offences"); sb_u64(d, b->entry.offences); sb_putc(d, ',');
-			sb_key(d, "flags"); sb_u64(d, b->entry.flags);
-			sb_putc(d, '}');
-		}
-		sb_puts(d, "]}");
-		free(rows);
-		return 0;
+		first = h_list_bans(env, d, CALY_MID_BAN4, 0, first);
+		first = h_list_bans(env, d, CALY_MID_BAN6, 1, first);
+	} else if (caly_strcaseeq(what, "allow")) {
+		first = h_list_lpm(env, d, CALY_MID_ALLOW4, 0, first);
+		first = h_list_lpm(env, d, CALY_MID_ALLOW6, 1, first);
+	} else if (caly_strcaseeq(what, "block")) {
+		first = h_list_lpm(env, d, CALY_MID_BLOCK4, 0, first);
+		first = h_list_lpm(env, d, CALY_MID_BLOCK6, 1, first);
+	} else if (caly_strcaseeq(what, "local")) {
+		first = h_list_lpm(env, d, CALY_MID_LOCAL4, 0, first);
+		first = h_list_lpm(env, d, CALY_MID_LOCAL6, 1, first);
+	} else {
+		*code = "bad_request";
+		*msg  = "unknown list; use allow|block|local|bans";
+		return -1;
 	}
-
-	{
-		int set;
-		struct caly_rule_dump *rows = NULL;
-		size_t n = 0, i;
-
-		if (caly_strcaseeq(what, "allow"))
-			set = CALY_SET_ALLOW;
-		else if (caly_strcaseeq(what, "block"))
-			set = CALY_SET_BLOCK;
-		else if (caly_strcaseeq(what, "local"))
-			set = CALY_SET_LOCAL;
-		else {
-			*code = "bad_request";
-			*msg  = "unknown list; use allow|block|local|bans";
-			return -1;
-		}
-		if (caly_set_dump(env->maps, set, CALY_FAM_ANY, &rows, &n) != 0) {
-			*code = "internal";
-			*msg  = "set dump failed";
-			return -1;
-		}
-		sb_puts(d, "{\"entries\":[");
-		for (i = 0; i < n; i++) {
-			const struct caly_rule_dump *r = &rows[i];
-
-			if (i) sb_putc(d, ',');
-			sb_putc(d, '{');
-			sb_key(d, "cidr"); ctl_emit_addr(d, &r->cidr); sb_putc(d, ',');
-			sb_key(d, "family"); sb_u64(d, r->cidr.family); sb_putc(d, ',');
-			sb_key(d, "flags"); sb_u64(d, r->meta.flags); sb_putc(d, ',');
-			sb_key(d, "tag"); sb_u64(d, r->meta.tag); sb_putc(d, ',');
-			sb_key(d, "added_ns"); sb_u64(d, r->meta.added_ns); sb_putc(d, ',');
-			sb_key(d, "hits"); sb_u64(d, r->meta.hits);
-			sb_putc(d, '}');
-		}
-		sb_puts(d, "]}");
-		free(rows);
-		return 0;
-	}
+	(void)first;
+	sb_puts(d, "]}");
+	return 0;
 }
 
 static int h_ban(const struct caly_ctl_env *env, struct sbuf *d,
@@ -1118,7 +1323,7 @@ static int h_ban(const struct caly_ctl_env *env, struct sbuf *d,
 	__u64  ttl = 0;
 	__u32  flags = CALY_BAN_F_MANUAL;
 	int    permanent = 0;
-	int    idx, rc;
+	int    idx;
 
 	if (ctl_arg_cidr(jp, args, "cidr", &c, code, msg) != 0)
 		return -1;
@@ -1144,8 +1349,7 @@ static int h_ban(const struct caly_ctl_env *env, struct sbuf *d,
 	else if (!permanent)
 		ttl = env->cfg->ban_ttl_base_ns;
 
-	rc = caly_ban_add(env->maps, &c, ttl, 0, flags);
-	if (rc != 0) {
+	if (ctl_ban_add(env->bpf, &c, ttl, flags) != 0) {
 		*code = "internal";
 		*msg  = "ban insert failed";
 		return -1;
@@ -1163,8 +1367,7 @@ static int h_unban(const struct caly_ctl_env *env, struct sbuf *d,
 
 	if (ctl_arg_cidr(jp, args, "cidr", &c, code, msg) != 0)
 		return -1;
-	rc = caly_ban_del(env->maps, &c);
-	/* -ENOENT is "nothing to remove", still a success from the CLI's view */
+	rc = ctl_ban_del(env->bpf, &c);
 	sb_puts(d, "{\"changed\":");
 	sb_u64(d, (rc == 0) ? 1 : 0);
 	sb_putc(d, '}');
@@ -1176,16 +1379,18 @@ static int h_set_add(const struct caly_ctl_env *env, struct sbuf *d,
 		     const char **code, const char **msg)
 {
 	struct caly_cidr c;
-	int rc;
+	int v6, rc;
 
 	if (ctl_arg_cidr(jp, args, "cidr", &c, code, msg) != 0)
 		return -1;
-	if (set == CALY_SET_BLOCK && ctl_is_default_route(&c)) {
+	if (set == CTL_SET_BLOCK && ctl_is_default_route(&c)) {
 		*code = "refused";
 		*msg  = "refusing to blocklist the default route";
 		return -1;
 	}
-	rc = caly_set_add(env->maps, set, &c);
+	v6 = (c.family == CALY_UTIL_AF_INET6);
+	rc = caly_lpm_insert(env->bpf, ctl_lpm_map_id(set, v6), &c, 0,
+			     CALY_TAG_CLI);
 	if (rc != 0 && rc != -EEXIST) {
 		*code = "internal";
 		*msg  = "set insert failed";
@@ -1204,7 +1409,7 @@ static int h_set_del(const struct caly_ctl_env *env, struct sbuf *d,
 
 	if (ctl_arg_cidr(jp, args, "cidr", &c, code, msg) != 0)
 		return -1;
-	rc = caly_set_del(env->maps, set, &c);
+	rc = ctl_set_del(env->bpf, set, &c);
 	sb_puts(d, "{\"changed\":");
 	sb_u64(d, (rc == 0) ? 1 : 0);
 	sb_putc(d, '}');
@@ -1228,7 +1433,7 @@ static int h_mode(const struct caly_ctl_env *env, struct sbuf *d,
 		*msg  = "mode out of range (0..4)";
 		return -1;
 	}
-	env->cfg->mode = (__u32)mode;
+	env->cfg->mode  = (__u32)mode;
 	*env->base_mode = (__u32)mode;
 	*env->cur_mode  = (__u32)mode;
 	if (caly_bpf_config_write(env->bpf, env->cfg) != 0) {
@@ -1247,11 +1452,10 @@ static int h_port(const struct caly_ctl_env *env, struct sbuf *d,
 		  const char **msg)
 {
 	char   proto[8];
-	int    is_udp;
+	int    is_udp, fd, p, idx;
 	__u64  first = 0, last = 0, rate = 0, burst = 0;
 	char   action[16];
 	struct port_rule pr;
-	int    idx, p;
 	__u32  changed = 0;
 
 	idx = j_obj_get(jp, args, "proto");
@@ -1315,8 +1519,16 @@ static int h_port(const struct caly_ctl_env *env, struct sbuf *d,
 		return -1;
 	}
 
+	fd = ctl_fd(env->bpf, is_udp ? CALY_MID_PORT_UDP : CALY_MID_PORT_TCP);
+	if (fd < 0) {
+		*code = "internal";
+		*msg  = "port map unavailable";
+		return -1;
+	}
 	for (p = (int)first; p <= (int)last; p++) {
-		if (caly_port_set(env->maps, is_udp, (__u32)p, &pr) == 0)
+		__u32 key = (__u32)p;
+
+		if (bpf_map_update_elem(fd, &key, &pr, BPF_ANY) == 0)
 			changed++;
 	}
 	sb_puts(d, "{\"changed\":");
@@ -1342,13 +1554,12 @@ static int h_conntrack(const struct caly_ctl_env *env, struct sbuf *d,
 		       struct jparse *jp, int args, const char **code,
 		       const char **msg)
 {
-	struct caly_conn_dump *rows = NULL;
-	size_t n = 0, i, emitted = 0;
+	unsigned char *keys = NULL, *vals = NULL;
+	long cnt, j;
+	size_t emitted = 0;
 	__u64  limit = 50;
 	__u32  want_proto = 0;
-	struct caly_cidr src;
-	int    have_src = 0;
-	int    idx;
+	int    idx, fd;
 
 	idx = j_obj_get(jp, args, "limit");
 	if (idx >= 0)
@@ -1363,24 +1574,27 @@ static int h_conntrack(const struct caly_ctl_env *env, struct sbuf *d,
 		if (j_str_dup(jp, idx, pbuf, sizeof(pbuf)) == 0)
 			want_proto = ctl_proto_num(pbuf);
 	}
-	idx = j_obj_get(jp, args, "src");
-	if (idx >= 0) {
-		char sbuf[CALY_CIDR_STRLEN];
 
-		if (j_str_dup(jp, idx, sbuf, sizeof(sbuf)) == 0 &&
-		    caly_parse_cidr(sbuf, &src) == 0)
-			have_src = 1;
+	fd = ctl_fd(env->bpf, CALY_MID_CONN);
+	sb_puts(d, "{\"flows\":[");
+	if (fd < 0) {
+		sb_puts(d, "]}");
+		return 0;
 	}
-
-	if (caly_conn_dump(env->maps, &rows, &n) != 0) {
+	cnt = ctl_map_collect(fd, sizeof(struct conn_key),
+			      sizeof(struct conn_state), &keys, &vals);
+	if (cnt < 0) {
 		*code = "internal";
 		*msg  = "conntrack dump failed";
 		return -1;
 	}
-	sb_puts(d, "{\"flows\":[");
-	for (i = 0; i < n && emitted < limit; i++) {
-		const struct conn_key   *k = &rows[i].key;
-		const struct conn_state *st = &rows[i].state;
+	for (j = 0; j < cnt && emitted < limit; j++) {
+		const struct conn_key   *k =
+			(const struct conn_key *)(keys + (size_t)j * sizeof(*k));
+		const struct conn_state *st =
+			(const struct conn_state *)(vals + (size_t)j * sizeof(*st));
+		__u32 fam = (k->family == CALY_AF_INET) ?
+			    CALY_UTIL_AF_INET : CALY_UTIL_AF_INET6;
 		__u8 saddr[16], daddr[16];
 
 		if (want_proto && k->proto != want_proto)
@@ -1394,28 +1608,14 @@ static int h_conntrack(const struct caly_ctl_env *env, struct sbuf *d,
 			memcpy(saddr, k->saddr, 16);
 			memcpy(daddr, k->daddr, 16);
 		}
-		if (have_src) {
-			__u32 fam = (k->family == CALY_AF_INET) ?
-				    CALY_UTIL_AF_INET : CALY_UTIL_AF_INET6;
-			size_t blen = (fam == CALY_UTIL_AF_INET) ? 4 : 16;
 
-			if (src.family != fam ||
-			    memcmp(saddr, src.addr, blen) != 0)
-				continue;
-		}
 		if (emitted) sb_putc(d, ',');
 		sb_putc(d, '{');
 		sb_key(d, "family"); sb_u64(d, k->family); sb_putc(d, ',');
 		sb_key(d, "proto"); sb_u64(d, k->proto); sb_putc(d, ',');
-		sb_key(d, "saddr");
-		ctl_emit_addr_only(d, (k->family == CALY_AF_INET) ?
-				   CALY_UTIL_AF_INET : CALY_UTIL_AF_INET6, saddr);
-		sb_putc(d, ',');
+		sb_key(d, "saddr"); ctl_emit_addr(d, fam, saddr); sb_putc(d, ',');
 		sb_key(d, "sport"); sb_u64(d, ntohs(k->sport)); sb_putc(d, ',');
-		sb_key(d, "daddr");
-		ctl_emit_addr_only(d, (k->family == CALY_AF_INET) ?
-				   CALY_UTIL_AF_INET : CALY_UTIL_AF_INET6, daddr);
-		sb_putc(d, ',');
+		sb_key(d, "daddr"); ctl_emit_addr(d, fam, daddr); sb_putc(d, ',');
 		sb_key(d, "dport"); sb_u64(d, ntohs(k->dport)); sb_putc(d, ',');
 		sb_key(d, "state"); sb_u64(d, st->state); sb_putc(d, ',');
 		sb_key(d, "flags"); sb_u64(d, st->flags); sb_putc(d, ',');
@@ -1429,8 +1629,30 @@ static int h_conntrack(const struct caly_ctl_env *env, struct sbuf *d,
 		sb_putc(d, '}');
 		emitted++;
 	}
+	free(keys);
+	free(vals);
 	sb_puts(d, "]}");
-	free(rows);
+	return 0;
+}
+
+static int ctl_ban_flush_one(const struct caly_bpf *b, int mapid, size_t ksz,
+			     size_t *removed)
+{
+	unsigned char *keys = NULL, *vals = NULL;
+	long cnt, j;
+	int fd = ctl_fd(b, mapid);
+
+	if (fd < 0)
+		return 0;
+	cnt = ctl_map_collect(fd, ksz, sizeof(struct ban_entry), &keys, &vals);
+	if (cnt < 0)
+		return -1;
+	for (j = 0; j < cnt; j++) {
+		if (bpf_map_delete_elem(fd, keys + (size_t)j * ksz) == 0)
+			(*removed)++;
+	}
+	free(keys);
+	free(vals);
 	return 0;
 }
 
@@ -1439,7 +1661,10 @@ static int h_unban_all(const struct caly_ctl_env *env, struct sbuf *d,
 {
 	size_t removed = 0;
 
-	if (caly_ban_flush(env->maps, CALY_FAM_ANY, &removed) != 0) {
+	if (ctl_ban_flush_one(env->bpf, CALY_MID_BAN4, sizeof(__u32),
+			      &removed) != 0 ||
+	    ctl_ban_flush_one(env->bpf, CALY_MID_BAN6, sizeof(struct in6_key),
+			      &removed) != 0) {
 		*code = "internal";
 		*msg  = "ban flush failed";
 		return -1;
@@ -1460,7 +1685,6 @@ static int h_reload(const struct caly_ctl_env *env, struct sbuf *d)
 	return 0;
 }
 
-/* subscribe just acknowledges; the caller adopts the fd into the event set. */
 static int h_subscribe(struct sbuf *d)
 {
 	sb_puts(d, "{\"streams\":[\"events\"]}");
@@ -1468,8 +1692,30 @@ static int h_subscribe(struct sbuf *d)
 }
 
 /* =========================================================================
- * Dispatch
+ * Response helpers + dispatch
  * ========================================================================= */
+
+static void ctl_send_raw(int fd, const char *buf, size_t len)
+{
+	(void)caly_write_all(fd, buf, len);
+}
+
+static void ctl_send_err(int fd, __u64 id, const char *code, const char *msg)
+{
+	struct sbuf s;
+
+	sb_init(&s);
+	sb_puts(&s, "{\"id\":");
+	sb_u64(&s, id);
+	sb_puts(&s, ",\"ok\":false,\"error\":");
+	sb_jstrz(&s, msg ? msg : "error");
+	sb_puts(&s, ",\"code\":");
+	sb_jstrz(&s, code ? code : "error");
+	sb_puts(&s, "}\n");
+	if (!s.err)
+		ctl_send_raw(fd, s.buf, s.len);
+	sb_free(&s);
+}
 
 enum caly_ctl_action caly_ctl_dispatch(const struct caly_ctl_env *env, int fd,
 				       const char *line, size_t len)
@@ -1484,11 +1730,10 @@ enum caly_ctl_action caly_ctl_dispatch(const struct caly_ctl_env *env, int fd,
 	struct sbuf    data;
 	int            subscribed = 0;
 
-	/* Trim a trailing CR/LF the framer may have left. */
 	while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r'))
 		len--;
 	if (len == 0)
-		return CALY_CTL_CONTINUE;   /* keepalive blank line */
+		return CALY_CTL_CONTINUE;
 
 	copy = malloc(len + 1);
 	jp = calloc(1, sizeof(*jp));
@@ -1525,11 +1770,9 @@ enum caly_ctl_action caly_ctl_dispatch(const struct caly_ctl_env *env, int fd,
 		free(jp);
 		return CALY_CTL_CONTINUE;
 	}
-	/*
-	 * calyctl nests parameters under "args"; calywatch puts them flat at the
-	 * top level. When there is no explicit "args" object, resolve parameter
-	 * lookups against the request root so both shapes work unchanged.
-	 */
+
+	/* calyctl nests parameters under "args"; calywatch puts them flat at the
+	 * top level. Fall back to the root when there is no explicit args. */
 	args = j_obj_get(jp, root, "args");
 	if (args < 0)
 		args = root;
@@ -1555,13 +1798,13 @@ enum caly_ctl_action caly_ctl_dispatch(const struct caly_ctl_env *env, int fd,
 		   caly_strcaseeq(cmd, "flush")) {
 		hrc = h_unban_all(env, &data, &code, &msg);
 	} else if (caly_strcaseeq(cmd, "allow")) {
-		hrc = h_set_add(env, &data, jp, args, CALY_SET_ALLOW, &code, &msg);
+		hrc = h_set_add(env, &data, jp, args, CTL_SET_ALLOW, &code, &msg);
 	} else if (caly_strcaseeq(cmd, "unallow")) {
-		hrc = h_set_del(env, &data, jp, args, CALY_SET_ALLOW, &code, &msg);
+		hrc = h_set_del(env, &data, jp, args, CTL_SET_ALLOW, &code, &msg);
 	} else if (caly_strcaseeq(cmd, "block")) {
-		hrc = h_set_add(env, &data, jp, args, CALY_SET_BLOCK, &code, &msg);
+		hrc = h_set_add(env, &data, jp, args, CTL_SET_BLOCK, &code, &msg);
 	} else if (caly_strcaseeq(cmd, "unblock")) {
-		hrc = h_set_del(env, &data, jp, args, CALY_SET_BLOCK, &code, &msg);
+		hrc = h_set_del(env, &data, jp, args, CTL_SET_BLOCK, &code, &msg);
 	} else if (caly_strcaseeq(cmd, "mode")) {
 		hrc = h_mode(env, &data, jp, args, &code, &msg);
 	} else if (caly_strcaseeq(cmd, "port")) {
@@ -1569,7 +1812,7 @@ enum caly_ctl_action caly_ctl_dispatch(const struct caly_ctl_env *env, int fd,
 	} else if (caly_strcaseeq(cmd, "conntrack")) {
 		hrc = h_conntrack(env, &data, jp, args, &code, &msg);
 	} else if (caly_strcaseeq(cmd, "reload")) {
-		hrc = h_reload(env);
+		hrc = h_reload(env, &data);
 	} else if (caly_strcaseeq(cmd, "subscribe")) {
 		hrc = h_subscribe(&data);
 		if (hrc == 0)
@@ -1644,8 +1887,8 @@ int caly_ctl_format_event(const struct event *ev, char *buf, size_t cap)
 	sb_key(&s, "ts_ns"); sb_u64(&s, ev->ts_ns); sb_putc(&s, ',');
 	sb_key(&s, "ban_ttl_ns"); sb_u64(&s, ev->ban_ttl_ns); sb_putc(&s, ',');
 	sb_key(&s, "value"); sb_u64(&s, ev->value); sb_putc(&s, ',');
-	sb_key(&s, "saddr"); ctl_emit_addr_only(&s, fam, saddr); sb_putc(&s, ',');
-	sb_key(&s, "daddr"); ctl_emit_addr_only(&s, fam, daddr); sb_putc(&s, ',');
+	sb_key(&s, "saddr"); ctl_emit_addr(&s, fam, saddr); sb_putc(&s, ',');
+	sb_key(&s, "daddr"); ctl_emit_addr(&s, fam, daddr); sb_putc(&s, ',');
 	sb_key(&s, "family"); sb_u64(&s, ev->family); sb_putc(&s, ',');
 	sb_key(&s, "ifindex"); sb_u64(&s, ev->ifindex); sb_putc(&s, ',');
 	sb_key(&s, "reason"); sb_u64(&s, ev->reason); sb_putc(&s, ',');

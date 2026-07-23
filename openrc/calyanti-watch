@@ -1,0 +1,66 @@
+#!/sbin/openrc-run
+# SPDX-License-Identifier: BSD-2-Clause OR GPL-2.0
+#
+# Caly Anti - layer-7 log watcher (OpenRC).
+#
+# calywatch tails logs, applies rule sets, and pushes offenders down into the
+# XDP ban maps through the daemon's control socket. It never touches the
+# firewall directly, so it needs no elevated network privileges.
+#
+# Not started by default. Enable with:
+#     rc-update add calyanti-watch default && rc-service calyanti-watch start
+# or pass --enable-watch to scripts/install.sh.
+#
+# Overrides belong in /etc/conf.d/calyanti-watch.
+
+name="Caly Anti watcher"
+description="Caly Anti layer-7 log watcher"
+
+: "${calyanti_confdir:=/etc/calyanti}"
+: "${calyanti_rundir:=/run/calyanti}"
+: "${calyanti_logdir:=/var/log/calyanti}"
+: "${calyanti_statedir:=/var/lib/calyanti}"
+: "${calywatch_config:=${calyanti_confdir}/calywatch.conf}"
+: "${CALYWATCH_OPTS:=}"
+
+command="/usr/sbin/calywatch"
+command_args="--config ${calywatch_config} --foreground ${CALYWATCH_OPTS} run"
+
+supervisor="supervise-daemon"
+pidfile="${calyanti_rundir}/calyanti-watch.pid"
+respawn_delay=10
+respawn_max=5
+respawn_period=300
+error_log="${calyanti_logdir}/calyanti-watch.err"
+
+# Telemetry must never win against the dataplane under pressure.
+SSD_NICELEVEL=5
+rc_ulimit="-n 16384"
+
+depend() {
+	need calyanti
+	use logger
+	after calyanti
+}
+
+start_pre() {
+	if [ ! -x "${command}" ]; then
+		eerror "${command} is missing. Re-run the installer with --enable-watch."
+		return 1
+	fi
+	checkpath -d -m 0750 -o root:root "${calyanti_rundir}" || return 1
+	checkpath -d -m 0750 -o root:root "${calyanti_logdir}" || return 1
+	checkpath -d -m 0750 -o root:root "${calyanti_statedir}" || return 1
+
+	if [ ! -S "${calyanti_rundir}/control.sock" ]; then
+		ewarn "${calyanti_rundir}/control.sock is absent: the daemon is not"
+		ewarn "running yet. calywatch will retry the control socket."
+	fi
+
+	if [ ! -x /sbin/supervise-daemon ] && [ ! -x /usr/sbin/supervise-daemon ]; then
+		unset supervisor
+		command_background="yes"
+		ewarn "supervise-daemon not found; running without supervision"
+	fi
+	return 0
+}

@@ -1,0 +1,284 @@
+# ---------------------------------------------------------------------------
+# Caly Anti - calywatch rule set: generic services
+#
+# Rule file syntax is documented at the top of nginx.rules and in full in
+# watcher/README.md.
+#
+# Point this at the box's general auth/system logs:
+#   /var/log/auth.log        Debian, Ubuntu
+#   /var/log/secure          RHEL, Alma, Rocky, Oracle, Amazon Linux, Fedora
+#   /var/log/messages        Alpine / busybox syslog, SUSE
+#   /var/log/maillog         Postfix/Dovecot on RHEL family
+#   journalctl (no unit)     everything, via a journal source with no unit=
+#
+# It covers the services that are on almost every server and that are attacked
+# from the moment a port opens: PAM, Postfix SASL, Dovecot, vsftpd/ProFTPD/
+# Pure-FTPd, MySQL/MariaDB, PostgreSQL, Redis, WireGuard/OpenVPN, and the
+# kernel's own martian/rate-limit chatter.
+#
+# Every rule extracts the address with a permissive character class and hands
+# it to Python's ipaddress module for strict validation.  A log line is
+# attacker-controlled data: it is never evaluated, never interpolated into a
+# shell, and never turned into a ban target unless it parses as a real address
+# that is not on the allowlist.
+# ---------------------------------------------------------------------------
+
+name    = generic
+desc    = PAM, mail, FTP, database and VPN authentication abuse
+window  = 600s
+action  = ban
+ttl     = 1h
+
+# ---------------------------------------------------------------------------
+# PAM: the common denominator.  Every service that authenticates through PAM
+# and records rhost= lands here, including sshd, sudo, su, login, vsftpd,
+# proftpd, dovecot, cockpit and webmin.
+# ---------------------------------------------------------------------------
+[pam-auth-failure]
+desc      = pam_unix / pam_sss authentication failure with a remote host
+prefilter = rhost=
+regex     = pam_(?:unix|sss|ldap|winbind)\([^)]{1,64}\):\s+authentication failure;[^\n]{0,256}?\brhost=(?P<ip>[0-9A-Fa-f:.]{3,45})
+threshold = 6
+window    = 600s
+ttl       = 1h
+reason    = pam-auth-failure
+severity  = 6
+
+[pam-account-locked]
+desc      = pam_faillock / pam_tally lockouts driven from a remote host
+prefilter = rhost=
+regex     = pam_(?:faillock|tally2?)\([^)]{1,64}\):[^\n]{0,256}?\brhost=(?P<ip>[0-9A-Fa-f:.]{3,45})
+threshold = 3
+window    = 900s
+ttl       = 4h
+reason    = pam-lockout
+severity  = 8
+
+# ---------------------------------------------------------------------------
+# A successful PAM session from an address clears its counters here.  Same
+# reasoning as sshd-auth-success: it cannot be produced without authenticating.
+# ---------------------------------------------------------------------------
+[pam-session-opened]
+desc      = successful remote session: clear strikes and soft-allow
+action    = ignore
+ttl       = 1h
+severity  = 0
+prefilter = rhost=
+regex     = pam_unix\([^)]{1,64}\):\s+session opened for user\s+\S{1,64}[^\n]{0,128}\brhost=(?P<ip>[0-9A-Fa-f:.]{3,45})
+regex     = \bAccepted\s+(?:password|publickey|keyboard-interactive(?:/pam)?)\s+for\s+\S{1,64}\s+from\s+(?P<ip>[0-9A-Fa-f:.]{3,45})\s+port\s+\d{1,5}
+
+# ---------------------------------------------------------------------------
+# Postfix SASL: the single most-attacked mail surface.  submission/587 and
+# smtps/465 credential stuffing runs at thousands of attempts an hour.
+# ---------------------------------------------------------------------------
+[postfix-sasl-fail]
+desc      = Postfix SASL LOGIN/PLAIN authentication failure
+prefilter = SASL
+regex     = warning:\s+\S{0,255}\[(?P<ip>[0-9A-Fa-f:.]{3,45})\]:\s+SASL\s+(?:LOGIN|PLAIN|CRAM-MD5|DIGEST-MD5|XOAUTH2)\s+authentication failed
+threshold = 5
+window    = 600s
+ttl       = 4h
+reason    = smtp-auth-brute
+severity  = 7
+
+[postfix-unknown-user]
+desc      = Postfix recipient/sender address probing (RCPT harvesting)
+prefilter = NOQUEUE
+regex     = NOQUEUE:\s+reject:\s+RCPT from\s+\S{0,255}\[(?P<ip>[0-9A-Fa-f:.]{3,45})\]:\s+(?:550|554|450)\s
+threshold = 25
+window    = 600s
+ttl       = 2h
+reason    = smtp-rcpt-probe
+severity  = 6
+
+[postfix-protocol-abuse]
+desc      = Postfix protocol violations / non-SMTP commands (scanner traffic)
+prefilter = from unknown
+regex     = warning:\s+(?:non-SMTP command|Illegal address syntax|improper command pipelining)[^\n]{0,128}from\s+\S{0,255}\[(?P<ip>[0-9A-Fa-f:.]{3,45})\]
+regex     = lost connection after (?:AUTH|EHLO|CONNECT|UNKNOWN) from\s+\S{0,255}\[(?P<ip>[0-9A-Fa-f:.]{3,45})\]
+threshold = 20
+window    = 300s
+ttl       = 2h
+reason    = smtp-protocol-abuse
+severity  = 6
+
+# ---------------------------------------------------------------------------
+# Dovecot IMAP/POP3.
+# ---------------------------------------------------------------------------
+[dovecot-auth-fail]
+desc      = Dovecot IMAP/POP3 authentication failure
+prefilter = rip=
+regex     = (?:auth|imap-login|pop3-login|submission-login):[^\n]{0,256}?(?:auth failed|Aborted login|Disconnected \(auth failed|Disconnected \(no auth attempts)[^\n]{0,256}?\brip=(?P<ip>[0-9A-Fa-f:.]{3,45})
+threshold = 8
+window    = 600s
+ttl       = 4h
+reason    = imap-auth-brute
+severity  = 7
+
+# ---------------------------------------------------------------------------
+# Exim.
+# ---------------------------------------------------------------------------
+[exim-auth-fail]
+desc      = Exim authenticator failure
+prefilter = authenticator failed
+regex     = \b(?:login|plain|dovecot_\S{1,32})_?authenticator failed for\s+(?:\S{1,255}\s+)?[\[(](?P<ip>[0-9A-Fa-f:.]{3,45})[\])]
+threshold = 5
+window    = 600s
+ttl       = 4h
+reason    = smtp-auth-brute
+severity  = 7
+
+# ---------------------------------------------------------------------------
+# FTP: vsftpd, ProFTPD, Pure-FTPd.  FTP brute force is relentless because the
+# protocol has no rate limiting of its own.
+# ---------------------------------------------------------------------------
+[ftp-auth-fail]
+desc      = FTP authentication failure (vsftpd / ProFTPD / Pure-FTPd)
+prefilter = FTP
+regex     = vsftpd[^\n]{0,64}:\s+\[\S{1,64}\]\s+FAIL LOGIN:\s+Client\s+"(?P<ip>[0-9A-Fa-f:.]{3,45})"
+regex     = proftpd[^\n]{0,128}\((?:\S{1,255})?\[(?P<ip>[0-9A-Fa-f:.]{3,45})\]\)[^\n]{0,128}(?:no such user found|Login failed|USER \S{1,64}: no such user|Maximum login attempts)
+regex     = pure-ftpd[^\n]{0,64}\(\?@(?P<ip>[0-9A-Fa-f:.]{3,45})\)[^\n]{0,64}\[WARNING\]\s+Authentication failed
+threshold = 5
+window    = 600s
+ttl       = 4h
+reason    = ftp-auth-brute
+severity  = 7
+
+# ---------------------------------------------------------------------------
+# Databases exposed to the network.  Any failed login from off-box is either a
+# misconfigured app (fix it, then allowlist it) or an attack.
+# ---------------------------------------------------------------------------
+[mysql-auth-fail]
+desc      = MySQL / MariaDB access denied from a remote host
+prefilter = Access denied
+regex     = \[(?:Warning|Note|ERROR)\][^\n]{0,128}Access denied for user\s+'[^']{0,64}'@'(?P<ip>[0-9A-Fa-f:.]{3,45})'
+threshold = 6
+window    = 600s
+ttl       = 4h
+reason    = mysql-auth-brute
+severity  = 7
+
+[postgres-auth-fail]
+desc      = PostgreSQL authentication failure from a remote host
+prefilter = FATAL
+regex     = FATAL:\s+(?:password authentication failed for user|no pg_hba\.conf entry for host)[^\n]{0,128}?"?(?P<ip>[0-9A-Fa-f:.]{3,45})"?
+threshold = 6
+window    = 600s
+ttl       = 4h
+reason    = pgsql-auth-brute
+severity  = 7
+
+[redis-unauth]
+desc      = unauthenticated Redis command attempts (worm / cryptominer install)
+prefilter = Redis
+regex     = (?:DENIED Redis is running in protected mode|NOAUTH Authentication required)[^\n]{0,128}?(?P<ip>[0-9A-Fa-f:.]{3,45})
+threshold = 3
+window    = 300s
+ttl       = 12h
+reason    = redis-unauth
+severity  = 9
+
+# ---------------------------------------------------------------------------
+# VPN endpoints.
+#
+# ###################### SPOOFABLE SOURCE - DO NOT BAN ######################
+# Both rules below extract the source from CONNECTIONLESS, UNAUTHENTICATED UDP
+# events (WireGuard handshake junk; OpenVPN's earliest "TLS Error" before any
+# handshake completes).  A UDP datagram's source address is trivially forged, so
+# an off-path attacker can emit these packets with the source spoofed to any
+# victim - e.g. your upstream DNS resolver or a peer mail server - and, if these
+# were action=ban, drive calywatch into banning that third party (a remote,
+# source-spoofed DoS turning the defence into a weapon).  Unlike the TCP rules
+# above (SASL/IMAP/SSH/HTTP), where a completed handshake makes the source
+# non-forgeable, nothing here proves the source sent the packet.
+#
+# Therefore these ship as action=warn (detect + log, never ban).  Do NOT change
+# them to action=ban unless your logs come only from a transport where the peer
+# is verified (e.g. OpenVPN over TCP with tls-crypt), and even then prefer a
+# narrow allowlist/denylist over auto-banning a spoofable source.
+# ##########################################################################
+# ---------------------------------------------------------------------------
+[openvpn-auth-fail]
+desc      = OpenVPN TLS/auth failure (spoofable UDP source: warn only)
+action    = warn
+prefilter = openvpn
+regex     = openvpn[^\n]{0,64}:\s+(?P<ip>[0-9A-Fa-f:.]{3,45}):\d{1,5}\s+(?:TLS Error|VERIFY ERROR|AUTH_FAILED|TLS_ERROR)
+threshold = 8
+window    = 600s
+ttl       = 2h
+reason    = vpn-auth-brute
+severity  = 6
+
+[wireguard-handshake-junk]
+desc      = WireGuard handshake flood from an unknown peer (spoofable UDP source: warn only)
+action    = warn
+prefilter = wireguard
+regex     = wireguard[^\n]{0,64}:[^\n]{0,128}(?:Invalid handshake initiation|Packet has invalid mac|Handshake for peer \d+ did not complete)[^\n]{0,64}from\s+(?P<ip>[0-9A-Fa-f:.]{3,45}):\d{1,5}
+threshold = 60
+window    = 60s
+ttl       = 1h
+reason    = wg-handshake-flood
+severity  = 6
+
+# ---------------------------------------------------------------------------
+# Mail/web control panels and remote management surfaces that people forget
+# are listening.
+# ---------------------------------------------------------------------------
+[panel-auth-fail]
+desc      = Webmin / cockpit / Plesk / cPanel authentication failure
+prefilter = failed
+regex     = (?:webmin|cockpit|psa|cpaneld|dovecot-auth)[^\n]{0,64}:[^\n]{0,192}?(?:Invalid login|authentication failure|Failed login|LOGIN FAILED)[^\n]{0,128}?(?:from|rhost=|\[)\s?(?P<ip>[0-9A-Fa-f:.]{3,45})
+threshold = 5
+window    = 600s
+ttl       = 4h
+reason    = panel-auth-brute
+severity  = 7
+
+# ---------------------------------------------------------------------------
+# Kernel-level noise that identifies a hostile source.  These lines are
+# produced by the kernel itself, not by a network-facing parser, so they are a
+# high-confidence signal - but they are also rate limited by the kernel, so
+# the thresholds are low.
+#
+# Requires log_martians / a LOG target that emits SRC=.  Off by default
+# because most hosts do not enable martian logging.
+# ---------------------------------------------------------------------------
+[kernel-martian]
+desc      = kernel martian source report (spoofed / bogon source address)
+enabled   = no
+prefilter = martian
+regex     = kernel:[^\n]{0,64}martian (?:source|destination)\s+\S{1,45}\s+from\s+(?P<ip>[0-9A-Fa-f:.]{3,45})
+threshold = 5
+window    = 300s
+ttl       = 6h
+reason    = kernel-martian
+severity  = 8
+
+[kernel-firewall-drop]
+desc      = netfilter LOG target drops from one source (port scan / flood)
+enabled   = no
+prefilter = SRC=
+regex     = kernel:[^\n]{0,128}?\bSRC=(?P<ip>[0-9A-Fa-f:.]{3,45})\b[^\n]{0,256}?\bDPT=(?P<dport>\d{1,5})
+distinct  = dport
+threshold = 25
+window    = 120s
+ttl       = 6h
+reason    = port-scan
+severity  = 8
+
+# ---------------------------------------------------------------------------
+# Catch-all for anything that logs a bare "authentication failure ... from IP"
+# without matching a service-specific rule above.  Runs last, high threshold,
+# warn-only by default so it does not surprise anyone.  Turn action = ban once
+# you have watched what it actually matches on your box.
+# ---------------------------------------------------------------------------
+[generic-auth-failure]
+desc      = unclassified authentication failure mentioning a remote address
+action    = warn
+prefilter = fail
+regex     = (?i)\b(?:authentication fail(?:ed|ure)|login fail(?:ed|ure)|invalid (?:login|credentials|password)|access denied|permission denied)\b[^\n]{0,192}?\b(?:from|rhost=|client|host|address)\W{0,3}(?P<ip>[0-9A-Fa-f:.]{3,45})\b
+threshold = 15
+window    = 600s
+ttl       = 1h
+reason    = generic-auth-failure
+severity  = 4

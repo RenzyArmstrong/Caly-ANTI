@@ -1,0 +1,36 @@
+Caly Anti - XDP/eBPF network protection suite for Linux
+Copyright (C) 2026 The Caly Anti authors
+
+SPDX-License-Identifier: GPL-2.0-only
+
+This program is free software; you can redistribute it and/or modify it under
+the terms of version 2 of the GNU General Public License as published by the
+Free Software Foundation.
+
+This program is distributed in the hope that it will be useful, but WITHOUT ANY
+WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+PARTICULAR PURPOSE. See the GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License along with
+this program; if not, see <https://www.gnu.org/licenses/gpl-2.0.html>.
+
+The complete, canonical text of the GNU General Public License version 2 is
+available at:
+
+    https://www.gnu.org/licenses/gpl-2.0.txt
+
+You may place that verbatim text in a file named COPYING alongside this one; a
+distribution that includes the full license text there satisfies the GPL's
+requirement to convey the license with the program.
+
+-----------------------------------------------------------------------------
+Note on the eBPF objects
+-----------------------------------------------------------------------------
+The programs under src/bpf/ call Linux kernel BPF helper functions that the
+kernel exports only to GPL-compatible programs. Each BPF object therefore
+declares the license string "Dual BSD/GPL" (via the char _license[] SEC
+("license") variable) so the verifier permits those helper calls. This is a
+per-object kernel requirement and does not widen the license of the project as
+a whole, which is distributed under GPL-2.0-only as stated above. The userspace
+sources carry SPDX headers of "BSD-2-Clause OR GPL-2.0"; when distributed as
+part of this project they are conveyed under GPL-2.0.

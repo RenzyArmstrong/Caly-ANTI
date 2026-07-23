@@ -1,0 +1,98 @@
+# SPDX-License-Identifier: BSD-2-Clause OR GPL-2.0
+#
+# Caly Anti - layer-7 log watcher (calywatch).
+#
+# The XDP dataplane sees packets, not sessions. Everything at L7 - an HTTP
+# flood over completed handshakes, a WordPress/xmlrpc brute force, slowloris,
+# an SSH dictionary run - looks like legitimate traffic at L3/L4. calywatch
+# closes that gap: it tails logs, applies rule sets, and pushes offenders down
+# into the XDP ban maps through the daemon's control socket, where enforcing
+# them costs nothing per packet.
+#
+# It talks ONLY to the control socket (the daemon performs the privileged map
+# write), so it needs no CAP_NET_ADMIN and cannot touch the firewall or the
+# routing table even if a crafted log line compromised it. If you configure a
+# direct nft/ipset fallback (ban_backend other than socket/auto) you must relax
+# CapabilityBoundingSet and RestrictAddressFamilies below.
+#
+# Not enabled by default. Enable with:
+#     systemctl enable --now calyanti-watch.service
+# or pass --enable-watch to scripts/install.sh.
+
+[Unit]
+Description=Caly Anti layer-7 log watcher
+Documentation=file:/etc/calyanti/calywatch.conf
+
+# The watcher bans through the daemon's control socket, so it is useless
+# without the daemon and must stop when the daemon is stopped on purpose.
+Requires=calyanti.service
+After=calyanti.service
+PartOf=calyanti.service
+
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/calyanti/calyanti.env
+EnvironmentFile=-/etc/sysconfig/calyanti
+EnvironmentFile=-/etc/default/calyanti
+# `run` is the default subcommand; --foreground keeps it attached for Type=simple.
+# CALYWATCH_OPTS holds global options (e.g. --log-level debug) and MUST precede
+# the subcommand.
+ExecStart=/usr/sbin/calywatch --config /etc/calyanti/calywatch.conf --foreground $CALYWATCH_OPTS run
+ExecReload=/bin/kill -HUP $MAINPID
+
+Restart=on-failure
+RestartSec=10s
+TimeoutStopSec=15
+
+# Telemetry must never win against the dataplane under memory pressure.
+OOMScoreAdjust=200
+Nice=5
+
+LimitNOFILE=16384
+MemoryMax=256M
+
+RuntimeDirectory=calyanti
+RuntimeDirectoryPreserve=yes
+StateDirectory=calyanti
+StateDirectoryMode=0750
+LogsDirectory=calyanti
+LogsDirectoryMode=0750
+WorkingDirectory=/var/lib/calyanti
+
+# --- hardening -------------------------------------------------------------
+# calywatch reads log files and connects to the root-owned control socket, so
+# it runs as root (the socket is mode 0600). It performs NO privileged network
+# or BPF operation itself; every ban is delegated to the daemon. The capability
+# set reflects that: only DAC_READ_SEARCH, so it can read a log regardless of
+# ownership, and nothing else.
+NoNewPrivileges=yes
+CapabilityBoundingSet=CAP_DAC_READ_SEARCH
+AmbientCapabilities=CAP_DAC_READ_SEARCH
+
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+
+# The persisted offender state lives under the state directory.
+ReadWritePaths=/var/lib/calyanti
+
+# No AF_INET/AF_INET6: the watcher never opens a network socket. AF_UNIX reaches
+# the control socket and journald; AF_NETLINK is not needed on the socket path.
+RestrictAddressFamilies=AF_UNIX
+
+[Install]
+WantedBy=multi-user.target

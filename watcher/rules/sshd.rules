@@ -1,0 +1,228 @@
+# ---------------------------------------------------------------------------
+# Caly Anti - calywatch rule set: OpenSSH
+#
+# Rule file syntax is documented at the top of nginx.rules and in full in
+# watcher/README.md.
+#
+# INPUT: works unchanged against any of
+#   /var/log/auth.log        Debian, Ubuntu
+#   /var/log/secure          RHEL, Alma, Rocky, Oracle, Amazon Linux, Fedora
+#   journalctl -u sshd       (or -u ssh on Debian/Ubuntu)  via a journal source
+#   /var/log/messages        Alpine / busybox syslog with sshd logging there
+#
+# None of the regexes are anchored to the start of the line, so the syslog
+# timestamp+host+"sshd[123]:" prefix, the journald "--output=short-iso" prefix
+# and a bare "--output=cat" message all match identically.
+#
+# ############################ SAFETY ##################################
+# SSH is the management path.  Two independent things protect you here:
+#   1. calywatch.conf `allow` - your admin prefixes, checked before EVERY ban.
+#   2. protect_active_sessions = yes (default) - the peer address of every
+#      ESTABLISHED connection to a management port is auto-allowlisted, so the
+#      session you are typing in cannot be banned by its own log noise.
+# The XDP dataplane additionally forces TCP/22 into fw_config.mgmt_tcp_ports in
+# every mode, so a ban installed here never removes your ability to reconnect
+# from an allowlisted prefix.
+# ######################################################################
+# ---------------------------------------------------------------------------
+
+name    = sshd
+desc    = OpenSSH brute force, user enumeration and protocol abuse
+window  = 600s
+action  = ban
+ttl     = 1h
+
+# ---------------------------------------------------------------------------
+# A successful authentication clears this address's counters for every rule in
+# this file and soft-allows it for `ttl`.  You cannot forge this line into the
+# log without already being able to write to the log as root, and you cannot
+# produce it over the network without authenticating successfully.
+#
+# Set enabled = no if your logs are writable by a service account.
+# ---------------------------------------------------------------------------
+[sshd-auth-success]
+desc      = successful login: clear strikes and soft-allow this source
+action    = ignore
+ttl       = 1h
+severity  = 0
+prefilter = Accepted
+regex     = \bAccepted\s+(?:password|publickey|keyboard-interactive(?:/pam)?|gssapi-with-mic|hostbased|none)\s+for\s+\S{1,64}\s+from\s+(?P<ip>[0-9A-Fa-f:.]{3,45})\s+port\s+\d{1,5}
+
+# ---------------------------------------------------------------------------
+# Classic password brute force.  "Failed password for root" and "Failed
+# password for invalid user x" both match.
+# ---------------------------------------------------------------------------
+[sshd-failed-password]
+desc      = failed password authentication
+prefilter = Failed
+regex     = \bFailed\s+(?:password|keyboard-interactive/pam|hostbased|publickey)\s+for\s+(?:invalid user\s+)?\S{1,64}\s+from\s+(?P<ip>[0-9A-Fa-f:.]{3,45})\s+port\s+\d{1,5}
+threshold = 5
+window    = 600s
+ttl       = 1h
+reason    = sshd-brute
+severity  = 7
+
+# ---------------------------------------------------------------------------
+# Login attempts for accounts that do not exist.  Nobody typos "admin",
+# "oracle" and "ubuntu" in a row: this is a dictionary run.  Lower threshold
+# and longer TTL than a plain wrong password.
+# ---------------------------------------------------------------------------
+[sshd-invalid-user]
+desc      = authentication attempts against non-existent accounts
+prefilter = Invalid user
+regex     = \bInvalid user\s+\S{0,64}\s+from\s+(?P<ip>[0-9A-Fa-f:.]{3,45})(?:\s+port\s+\d{1,5})?
+threshold = 3
+window    = 600s
+ttl       = 4h
+reason    = sshd-invalid-user
+severity  = 8
+
+# ---------------------------------------------------------------------------
+# Distinct-username enumeration.  Even below the per-line thresholds above, an
+# address that tries 10 different usernames in 10 minutes is enumerating.
+# ---------------------------------------------------------------------------
+[sshd-user-enum]
+desc      = many distinct usernames from one source
+prefilter = user
+regex     = \b(?:Invalid user|Failed password for(?: invalid user)?|Failed publickey for|Connection closed by (?:invalid|authenticating) user)\s+(?P<user>\S{1,64})\s+(?:from\s+)?(?P<ip>[0-9A-Fa-f:.]{3,45})
+regex     = \b(?:Invalid user|Failed password for(?: invalid user)?)\s+(?P<user>\S{1,64})\s+from\s+(?P<ip>[0-9A-Fa-f:.]{3,45})
+distinct  = user
+threshold = 10
+window    = 600s
+ttl       = 6h
+reason    = sshd-user-enum
+severity  = 8
+
+# ---------------------------------------------------------------------------
+# MaxAuthTries exhausted in a single connection: six wrong keys/passwords back
+# to back is never a human.
+# ---------------------------------------------------------------------------
+[sshd-max-auth]
+desc      = maximum authentication attempts exceeded
+prefilter = maximum authentication
+regex     = error:\s+maximum authentication attempts exceeded for\s+(?:invalid user\s+)?\S{1,64}\s+from\s+(?P<ip>[0-9A-Fa-f:.]{3,45})\s+port\s+\d{1,5}
+threshold = 2
+window    = 600s
+ttl       = 4h
+reason    = sshd-maxauth
+severity  = 8
+
+# ---------------------------------------------------------------------------
+# Key-scanning bots: connect, offer a key or a username, disconnect before
+# authenticating.  Very high volume, very low cost to the attacker.  These are
+# the [preauth] lines.
+#
+# Threshold is deliberately higher than the password rules because flaky NAT,
+# monitoring probes and port scanners on shared hosting also produce them.
+# ---------------------------------------------------------------------------
+[sshd-preauth-churn]
+desc      = repeated pre-authentication disconnects (key scanning bots)
+prefilter = [preauth]
+regex     = \b(?:Connection closed by(?: authenticating| invalid)? (?:user \S{1,64} )?|Connection reset by(?: authenticating| invalid)? (?:user \S{1,64} )?|Disconnected from(?: authenticating| invalid)? (?:user \S{1,64} )?)(?P<ip>[0-9A-Fa-f:.]{3,45})\s+port\s+\d{1,5}[^\n]{0,64}\[preauth\]
+regex     = \bReceived disconnect from\s+(?P<ip>[0-9A-Fa-f:.]{3,45})\s+port\s+\d{1,5}[^\n]{0,128}\[preauth\]
+threshold = 20
+window    = 300s
+ttl       = 1h
+reason    = sshd-preauth-churn
+severity  = 6
+
+# ---------------------------------------------------------------------------
+# Not-SSH traffic aimed at the SSH port: HTTP requests, TLS ClientHellos,
+# vulnerability scanners.  Two of these is enough.
+# ---------------------------------------------------------------------------
+[sshd-bad-protocol]
+desc      = non-SSH protocol / invalid banner on the SSH port
+prefilter = from
+regex     = \bBad protocol version identification\s+'[^']{0,256}'\s+from\s+(?P<ip>[0-9A-Fa-f:.]{3,45})
+regex     = \bbanner exchange: Connection from\s+(?P<ip>[0-9A-Fa-f:.]{3,45})\s+port\s+\d{1,5}:\s+invalid format
+regex     = \bDid not receive identification string from\s+(?P<ip>[0-9A-Fa-f:.]{3,45})
+threshold = 4
+window    = 300s
+ttl       = 2h
+reason    = sshd-bad-protocol
+severity  = 7
+
+# ---------------------------------------------------------------------------
+# Algorithm negotiation failures.  Old clients trip this occasionally, so the
+# threshold allows for a genuinely misconfigured admin before it fires.
+# ---------------------------------------------------------------------------
+[sshd-no-kex]
+desc      = repeated key-exchange / cipher negotiation failures
+prefilter = Unable to negotiate
+regex     = \bUnable to negotiate with\s+(?P<ip>[0-9A-Fa-f:.]{3,45})\s+port\s+\d{1,5}
+threshold = 10
+window    = 300s
+ttl       = 1h
+reason    = sshd-no-kex
+severity  = 5
+
+# ---------------------------------------------------------------------------
+# Explicit policy denials: AllowUsers / DenyUsers / AllowGroups misses and
+# root login refusals.  Someone hitting these knows the account exists.
+# ---------------------------------------------------------------------------
+[sshd-not-allowed]
+desc      = login refused by AllowUsers / DenyUsers / PermitRootLogin
+prefilter = from
+regex     = \bUser\s+\S{1,64}\s+from\s+(?P<ip>[0-9A-Fa-f:.]{3,45})\s+not allowed because
+regex     = \bROOT LOGIN REFUSED FROM\s+(?P<ip>[0-9A-Fa-f:.]{3,45})
+regex     = \bAuthentication refused:\s+[^\n]{0,128}\s+from\s+(?P<ip>[0-9A-Fa-f:.]{3,45})
+threshold = 3
+window    = 600s
+ttl       = 4h
+reason    = sshd-policy-denied
+severity  = 8
+
+# ---------------------------------------------------------------------------
+# Reverse-DNS / possible-break-in warnings and TCP-wrapper refusals.
+# ---------------------------------------------------------------------------
+[sshd-breakin-warning]
+desc      = reverse mapping / POSSIBLE BREAK-IN ATTEMPT warnings
+prefilter = BREAK-IN
+regex     = \bPOSSIBLE BREAK-IN ATTEMPT[^\n]{0,64}
+regex     = \breverse mapping checking getaddrinfo for\s+\S{1,255}\s+\[(?P<ip>[0-9A-Fa-f:.]{3,45})\]
+threshold = 6
+window    = 600s
+ttl       = 1h
+reason    = sshd-breakin-warning
+severity  = 5
+
+[sshd-refused-connect]
+desc      = TCP wrapper / hosts.deny refusals
+prefilter = refused connect
+regex     = \brefused connect from\s+(?:\S{1,255}\s+\()?(?P<ip>[0-9A-Fa-f:.]{3,45})\)?
+threshold = 5
+window    = 300s
+ttl       = 2h
+reason    = sshd-refused
+severity  = 6
+
+# ---------------------------------------------------------------------------
+# PAM-level failures logged by sshd (and by su/sudo/login when this rule file
+# is pointed at auth.log).  Complements sshd's own "Failed password".
+# ---------------------------------------------------------------------------
+[sshd-pam-failure]
+desc      = pam_unix authentication failure with a remote host
+prefilter = rhost=
+regex     = pam_unix\((?:sshd|sudo|su|login):auth\):\s+authentication failure;[^\n]{0,256}?\brhost=(?P<ip>[0-9A-Fa-f:.]{3,45})
+threshold = 6
+window    = 600s
+ttl       = 1h
+reason    = pam-auth-failure
+severity  = 6
+
+# ---------------------------------------------------------------------------
+# Aggressive catch-all: a source producing a very large number of sshd log
+# lines of any kind inside a minute is flooding the daemon itself, which costs
+# CPU and fills the disk even when every attempt fails.
+#
+# Note this counts lines, not attempts, so it fires only on real volume.
+# ---------------------------------------------------------------------------
+[sshd-log-flood]
+desc      = sshd log-line flood from a single source (daemon CPU/disk abuse)
+prefilter = sshd
+regex     = \b(?:from|by)\s+(?:invalid user \S{1,64}\s+)?(?P<ip>[0-9A-Fa-f:.]{3,45})\s+port\s+\d{1,5}
+threshold = 120
+window    = 60s
+ttl       = 2h
+reason    = sshd-log-flood
+severity  = 7

@@ -1,0 +1,151 @@
+#!/sbin/openrc-run
+# SPDX-License-Identifier: BSD-2-Clause OR GPL-2.0
+#
+# Caly Anti - XDP/eBPF DDoS mitigation daemon (OpenRC).
+#
+# Installed by scripts/install.sh as /etc/init.d/calyanti on Alpine, Gentoo,
+# Artix and any other OpenRC system. Configuration overrides belong in
+# /etc/conf.d/calyanti, never in this file.
+
+name="Caly Anti"
+description="XDP/eBPF DDoS mitigation"
+description_reload="Re-read /etc/calyanti/calyanti.conf without dropping state"
+
+: "${calyanti_config:=/etc/calyanti/calyanti.conf}"
+: "${calyanti_pindir:=/sys/fs/bpf/calyanti}"
+: "${calyanti_bpffs:=/sys/fs/bpf}"
+: "${calyanti_rundir:=/run/calyanti}"
+: "${calyanti_logdir:=/var/log/calyanti}"
+: "${calyanti_statedir:=/var/lib/calyanti}"
+: "${CALYD_OPTS:=}"
+
+command="/usr/sbin/calyd"
+command_args="--config ${calyanti_config} ${CALYD_OPTS}"
+
+# supervise-daemon keeps the daemon in the foreground and restarts it on
+# unexpected exit. It needs OpenRC >= 0.21; start_pre() falls back to plain
+# start-stop-daemon supervision when it is missing.
+supervisor="supervise-daemon"
+pidfile="${calyanti_rundir}/calyanti.pid"
+respawn_delay=5
+respawn_max=5
+respawn_period=300
+output_log="${calyanti_logdir}/calyanti.log"
+error_log="${calyanti_logdir}/calyanti.err"
+
+# Pre-5.11 kernels charge BPF maps against RLIMIT_MEMLOCK; roughly 220 MB is
+# needed at the shipped map sizes.
+rc_ulimit="-l unlimited -n 65536"
+
+required_files="${calyanti_config}"
+extra_started_commands="reload selftest"
+extra_commands="checkconfig"
+description_selftest="Report attach state, counters and mode"
+description_checkconfig="Validate the configuration file and exit"
+
+depend() {
+	need localmount
+	use logger
+	after sysctl bootmisc modules
+	# Same ordering guarantee as the systemd unit: the filter is in place
+	# before interfaces are configured, so there is no unprotected window.
+	before net
+}
+
+_calyanti_mount_bpffs() {
+	# The daemon pins its maps under bpffs so that calyctl can attach
+	# without being the loader and state survives a restart.
+	if grep -q "[[:space:]]${calyanti_bpffs}[[:space:]][[:space:]]*bpf[[:space:]]" \
+	    /proc/mounts 2>/dev/null; then
+		return 0
+	fi
+	if grep -q "[[:space:]]bpf[[:space:]]" /proc/mounts 2>/dev/null; then
+		return 0
+	fi
+	ebegin "Mounting bpffs at ${calyanti_bpffs}"
+	mkdir -p "${calyanti_bpffs}" 2>/dev/null
+	mount -t bpf bpffs "${calyanti_bpffs}"
+	eend $? "Failed to mount bpffs; the daemon cannot pin its maps"
+}
+
+checkconfig() {
+	if [ ! -r "${calyanti_config}" ]; then
+		eerror "Configuration file ${calyanti_config} is missing"
+		eerror "Copy the sample from /usr/share/doc/calyanti/calyanti.conf"
+		return 1
+	fi
+	# --check-config is advisory: an older calyd that does not know the
+	# flag must not make the service unstartable.
+	if "${command}" --check-config "${calyanti_config}" >/dev/null 2>&1; then
+		einfo "Configuration ${calyanti_config} is valid"
+	fi
+	return 0
+}
+
+start_pre() {
+	checkconfig || return 1
+
+	checkpath -d -m 0750 -o root:root "${calyanti_rundir}" || return 1
+	checkpath -d -m 0750 -o root:root "${calyanti_logdir}" || return 1
+	checkpath -d -m 0750 -o root:root "${calyanti_statedir}" || return 1
+
+	_calyanti_mount_bpffs || return 1
+	checkpath -d -m 0700 -o root:root "${calyanti_pindir}" 2>/dev/null
+
+	if [ ! -x "${command}" ]; then
+		eerror "${command} is missing. Re-run the installer."
+		return 1
+	fi
+
+	# supervise-daemon appeared in OpenRC 0.21. On anything older, fall
+	# back to start-stop-daemon with a backgrounded daemon rather than
+	# refusing to start.
+	if [ ! -x /sbin/supervise-daemon ] && [ ! -x /usr/sbin/supervise-daemon ]; then
+		unset supervisor
+		command_background="yes"
+		ewarn "supervise-daemon not found; running without supervision"
+	fi
+	return 0
+}
+
+start_post() {
+	# Give the loader a moment to attach before anything that depends on us
+	# starts. Attach failures are reported by the daemon itself; this is
+	# only about ordering.
+	local i=0
+	while [ "${i}" -lt 20 ]; do
+		[ -e "${calyanti_pindir}/caly_config" ] && break
+		sleep 1
+		i=$((i + 1))
+	done
+	return 0
+}
+
+stop_post() {
+	# The daemon detaches on SIGTERM. If it was killed hard, the XDP program
+	# can survive it; leaving a stale program attached with no daemon to
+	# manage bans would be worse than removing it.
+	if [ -x /usr/sbin/calyctl ]; then
+		/usr/sbin/calyctl detach >/dev/null 2>&1
+	fi
+	return 0
+}
+
+reload() {
+	ebegin "Reloading ${name} configuration"
+	if [ -n "${supervisor}" ]; then
+		supervise-daemon "${RC_SVCNAME}" --signal HUP \
+			--pidfile "${pidfile}"
+	else
+		start-stop-daemon --signal HUP --pidfile "${pidfile}"
+	fi
+	eend $?
+}
+
+selftest() {
+	if [ ! -x /usr/sbin/calyctl ]; then
+		eerror "/usr/sbin/calyctl is not installed"
+		return 1
+	fi
+	/usr/sbin/calyctl status
+}

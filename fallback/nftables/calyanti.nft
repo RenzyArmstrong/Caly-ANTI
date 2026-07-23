@@ -1,0 +1,733 @@
+#!/usr/sbin/nft -f
+#
+# =============================================================================
+#  Caly Anti - nftables fallback dataplane   (degradation ladder rung 4)
+# =============================================================================
+#
+#  This ruleset is used when the eBPF dataplane cannot run:
+#
+#    * /sys/kernel/btf/vmlinux is absent (no CO-RE, no XDP, no tc-BPF)
+#    * OpenVZ / some LXC containers (no XDP hook, no clsact)
+#    * kernel built without CONFIG_NET_CLS_BPF and without XDP
+#
+#  It is NOT a token ruleset. It reimplements as much of the XDP policy as
+#  nftables can express: allow / block / dynamic-ban sets, conntrack fast
+#  path, per-source token buckets (pps, bps, SYN, UDP, ICMP, new-conn),
+#  a strike counter that feeds an auto-ban set with a timeout, per-source
+#  concurrent connection ceilings, the reflection/amplification source-port
+#  filter, the illegal TCP flag combinations, martian/bogon source filtering,
+#  fragment anomalies, per-port policy and an optional kernel SYN proxy.
+#
+#  What nftables CANNOT do, and which therefore only exists on rungs 1-3:
+#    * per-source distinct-destination-port scan detection (Bloom filter).
+#      Approximated here by a rate limit on probes of explicitly closed ports.
+#    * escalating ban TTLs (each ban here uses one flat timeout).
+#    * per-packet byte accounting into a shared per-source bucket at line
+#      rate without an skb allocation.
+#
+# -----------------------------------------------------------------------------
+#  ISOLATION
+# -----------------------------------------------------------------------------
+#  Everything lives in `table inet calyanti`. We never touch `filter`,
+#  `firewalld`, `ufw`, `libvirt` or any other table, and every base chain
+#  has `policy accept`, so loading this file can never turn the box into a
+#  default-deny firewall by accident. Only the explicit `jump caly_drop`
+#  rules below drop anything.
+#
+# -----------------------------------------------------------------------------
+#  IDEMPOTENCY
+# -----------------------------------------------------------------------------
+#  The `table` / `delete table` preamble is the documented idempotent idiom:
+#  the add creates the table when it does not exist so that the delete can
+#  never fail, and both live in the same transaction as the new definition,
+#  so a reload is atomic - there is no instant where the box is unprotected.
+#
+# -----------------------------------------------------------------------------
+#  MANAGEMENT SAFETY  (read this before editing)
+# -----------------------------------------------------------------------------
+#  `caly_mgmt_tcp` ships containing 22 and is accepted near the top of BOTH
+#  base chains that can drop (caly_early, caly_input). Every rule ahead of
+#  that accept is either a bypass, the operator allowlist, an explicit
+#  operator blocklist, or an anomaly check that a legitimate SSH packet can
+#  never match (bogon source, illegal TCP flag combination). Nothing that
+#  fires on volume, reputation or policy runs before the mgmt accept.
+#
+#  Do not reorder those rules. `apply.sh` refuses to apply a ruleset whose
+#  mgmt set would be empty.
+#
+# -----------------------------------------------------------------------------
+#  CHAIN PRIORITIES
+# -----------------------------------------------------------------------------
+#  caly_early    prerouting  -450  runs BEFORE conntrack defrag (-400),
+#                                  raw (-300) and conntrack (-200), so it
+#                                  sees real fragments and drops floods
+#                                  before a conntrack entry is allocated.
+#                                  No `ct` matching is possible here.
+#  caly_input    input          0  after conntrack: `ct state` is available.
+#  caly_forward  forward        0  routed traffic, conntrack available.
+#
+# -----------------------------------------------------------------------------
+#  MARKER CONVENTION  (consumed by apply.sh, harmless to nft)
+# -----------------------------------------------------------------------------
+#    #@+TAG@ <rule>     the line is a COMMENT until apply.sh enables TAG
+#                       (it strips the leading "#@+TAG@ " token).
+#    <rule>  #@-TAG@    the line is ACTIVE until apply.sh enables TAG
+#                       (it deletes the whole line).
+#
+#  Tags used below:
+#    MONITOR         evaluate everything, drop nothing (fw_config monitor_only)
+#    DEFAULT_DENY    inbound to any port not explicitly opened is dropped
+#    DROP_PRIVATE    RFC1918 / CGNAT / ULA source is a martian
+#    DROP_ALL_FRAGS  refuse fragmented traffic outright
+#    URPF            strict reverse-path check (breaks asymmetric routing)
+#    SSHGUARD        rate limit + auto-ban brute force against the mgmt ports
+#    SYNPROXY        kernel SYN proxy (needs nf_synproxy_core, tcp_syncookies=2)
+#    LEGACY          reduced ruleset for old nft / old kernels: apply.sh
+#                    enables it only when the full ruleset fails `nft -c`
+#
+#  Rate literals cannot be parameterised with nft `define`s (the limit
+#  grammar takes an integer token, not an expression), so apply.sh rewrites
+#  them textually. The marker lives in the rule comment as [caly:NAME] and
+#  apply.sh only ever substitutes the numbers on a line carrying its marker.
+#
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Tunables that CAN be expressed as nft symbols.
+# apply.sh rewrites the block between the BEGIN/END markers from
+# /etc/calyanti/calyanti.conf; the values below are the standalone defaults.
+# -----------------------------------------------------------------------------
+# >>> CALYANTI-DEFINES-BEGIN
+# Interfaces that bypass the whole ruleset: loopback plus every interface the
+# operator declared as zone=lan / zone=dmz / disabled.  Mirrors the XDP
+# prelude "iface zone is LAN/DMZ -> XDP_PASS".
+define caly_lan_ifaces = { "lo" }
+# <<< CALYANTI-DEFINES-END
+
+# Idempotent, atomic replacement of our own table only.
+table inet calyanti
+delete table inet calyanti
+
+table inet calyanti {
+
+	# =====================================================================
+	# SETS
+	# =====================================================================
+
+	# --- operator allowlist: the escape hatch, consulted before every
+	# --- drop rule. Populated from `allow = <cidr>` in calyanti.conf.
+	set caly_allow4 {
+		type ipv4_addr
+		flags interval
+	}
+	set caly_allow6 {
+		type ipv6_addr
+		flags interval
+	}
+
+	# --- static operator blocklist (`block = <cidr>`).
+	set caly_block4 {
+		type ipv4_addr
+		flags interval
+	}
+	set caly_block6 {
+		type ipv6_addr
+		flags interval
+	}
+
+	# --- our own prefixes (`local = <cidr>`). A packet arriving from
+	# --- outside that claims one of these as its SOURCE is spoofed
+	# --- (LAND attack / reflected-self). Empty by default: an empty set
+	# --- simply never matches.
+	set caly_local4 {
+		type ipv4_addr
+		flags interval
+	}
+	set caly_local6 {
+		type ipv6_addr
+		flags interval
+	}
+
+	# --- dynamic auto-ban. Written by caly_ban_add from the packet path
+	# --- and by the CLI/daemon with `nft add element`. The timeout is the
+	# --- whole ban lifetime; a ban is NOT refreshed by the packets it
+	# --- drops, so a source can never be banned permanently by accident.
+	set caly_ban4 {
+		type ipv4_addr
+		flags dynamic,timeout
+		timeout 10m		# caly:bantimeout
+		size 262144
+	}
+	set caly_ban6 {
+		type ipv6_addr
+		flags dynamic,timeout
+		timeout 10m		# caly:bantimeout
+		size 262144
+	}
+
+	# --- management ports. TCP/22 is present unconditionally; apply.sh
+	# --- adds the operator's mgmt_tcp_ports / mgmt_udp_ports on top and
+	# --- refuses to run if the result would be empty.
+	set caly_mgmt_tcp {
+		type inet_service
+		flags interval
+		elements = { 22 }
+	}
+	set caly_mgmt_udp {
+		type inet_service
+		flags interval
+	}
+
+	# --- per-port policy (`tcp_port = <port> open|closed|ratelimit`).
+	set caly_open_tcp {
+		type inet_service
+		flags interval
+		elements = { 22 }
+	}
+	set caly_open_udp {
+		type inet_service
+		flags interval
+	}
+	set caly_closed_tcp {
+		type inet_service
+		flags interval
+	}
+	set caly_closed_udp {
+		type inet_service
+		flags interval
+	}
+
+	# --- SYN-proxy protected ports (`synproxy_port = <port>`). Only
+	# --- meaningful when the SYNPROXY tag is enabled.
+	set caly_synproxy_ports {
+		type inet_service
+		flags interval
+	}
+
+	# --- reflection / amplification SOURCE ports. Identical to
+	# --- CALY_AMP_PORTS_INIT in src/bpf/common.h. A UDP datagram whose
+	# --- SOURCE port is one of these and which is not part of a flow we
+	# --- started is a reflected attack, not a reply.
+	# --- Removing a port here is how you allowlist a reflective service
+	# --- you legitimately consume (`amp_exempt = 53`).
+	set caly_amp_ports {
+		type inet_service
+		flags interval
+		elements = {
+			17,	  19,	  53,	  69,	 111,
+			123,	 137,	 161,	 389,	 520,
+			623,	1434,	1900,	3283,	5093,
+			5351,	5353,  11211,  27015,  30718,
+			37810
+		}
+	}
+
+	# --- per-source token buckets. One dynamic set per bucket kind so a
+	# --- source exhausting its UDP budget does not also lose its TCP
+	# --- budget, exactly like rate_state.tb[] in the eBPF dataplane.
+	set caly_pps4 {
+		type ipv4_addr
+		flags dynamic,timeout
+		timeout 5m
+		size 262144
+	}
+	set caly_pps6 {
+		type ipv6_addr
+		flags dynamic,timeout
+		timeout 5m
+		size 262144
+	}
+	set caly_bps4 {
+		type ipv4_addr
+		flags dynamic,timeout
+		timeout 5m
+		size 262144
+	}
+	set caly_bps6 {
+		type ipv6_addr
+		flags dynamic,timeout
+		timeout 5m
+		size 262144
+	}
+	set caly_syn4 {
+		type ipv4_addr
+		flags dynamic,timeout
+		timeout 5m
+		size 262144
+	}
+	set caly_syn6 {
+		type ipv6_addr
+		flags dynamic,timeout
+		timeout 5m
+		size 262144
+	}
+	set caly_udp4 {
+		type ipv4_addr
+		flags dynamic,timeout
+		timeout 5m
+		size 262144
+	}
+	set caly_udp6 {
+		type ipv6_addr
+		flags dynamic,timeout
+		timeout 5m
+		size 262144
+	}
+	set caly_icmpr4 {
+		type ipv4_addr
+		flags dynamic,timeout
+		timeout 5m
+		size 65536
+	}
+	set caly_icmpr6 {
+		type ipv6_addr
+		flags dynamic,timeout
+		timeout 5m
+		size 65536
+	}
+	set caly_new4 {
+		type ipv4_addr
+		flags dynamic,timeout
+		timeout 5m
+		size 262144
+	}
+	set caly_new6 {
+		type ipv6_addr
+		flags dynamic,timeout
+		timeout 5m
+		size 262144
+	}
+
+	# --- per-source concurrent connection ceiling (nf_conncount).
+	set caly_cc4 {
+		type ipv4_addr
+		flags dynamic,timeout
+		timeout 10m
+		size 262144
+	}
+	set caly_cc6 {
+		type ipv6_addr
+		flags dynamic,timeout
+		timeout 10m
+		size 262144
+	}
+
+	# --- strike counter. A source only gets banned after N bucket
+	# --- violations inside the strike window, mirroring
+	# --- fw_config.strike_limit / strike_window_ns. One burst never bans.
+	set caly_strike4 {
+		type ipv4_addr
+		flags dynamic,timeout
+		timeout 5m
+		size 262144
+	}
+	set caly_strike6 {
+		type ipv6_addr
+		flags dynamic,timeout
+		timeout 5m
+		size 262144
+	}
+
+	# --- port-scan approximation: rate of probes against ports that are
+	# --- explicitly closed by policy.
+	set caly_scan4 {
+		type ipv4_addr
+		flags dynamic,timeout
+		timeout 5m
+		size 262144
+	}
+	set caly_scan6 {
+		type ipv6_addr
+		flags dynamic,timeout
+		timeout 5m
+		size 262144
+	}
+
+	# --- mgmt brute-force counter (SSHGUARD tag only).
+	set caly_mgmt4 {
+		type ipv4_addr
+		flags dynamic,timeout
+		timeout 30m
+		size 65536
+	}
+	set caly_mgmt6 {
+		type ipv6_addr
+		flags dynamic,timeout
+		timeout 30m
+		size 65536
+	}
+
+	# =====================================================================
+	# TERMINAL / HELPER CHAINS
+	# =====================================================================
+
+	# The single point where a packet actually dies. Every drop in this
+	# ruleset goes through here, which gives one authoritative drop counter
+	# and makes monitor mode a one-line change: in MONITOR the chain only
+	# counts and returns, so evaluation continues and nothing is ever lost.
+	chain caly_drop {
+		limit rate 5/second burst 10 packets log prefix "calyanti-drop: " level info
+		counter drop					#@-MONITOR@
+#@+MONITOR@ counter return
+	}
+
+	# Insert the offending source into the auto-ban set, then drop.
+	# `add` (not `update`) so an existing ban keeps its original deadline:
+	# a ban must not renew itself off the traffic it is already dropping.
+	chain caly_ban_add {
+		meta nfproto ipv4 add @caly_ban4 { ip saddr } counter	#@-LEGACY@
+		meta nfproto ipv6 add @caly_ban6 { ip6 saddr } counter	#@-LEGACY@
+		jump caly_drop
+	}
+
+	# Strike accounting. A source reaching the strike rate inside the
+	# strike window is banned; below it the packet is merely dropped.
+	chain caly_strike {
+		meta nfproto ipv4 update @caly_strike4 { ip saddr timeout 5m limit rate over 10/minute burst 10 packets } jump caly_ban_add comment "strike limit reached -> auto-ban [caly:strike]"	#@-LEGACY@
+		meta nfproto ipv6 update @caly_strike6 { ip6 saddr timeout 5m limit rate over 10/minute burst 10 packets } jump caly_ban_add comment "strike limit reached -> auto-ban [caly:strike]"	#@-LEGACY@
+		jump caly_drop
+	}
+
+	# Port-scan approximation: probes against explicitly closed ports.
+	# Under the threshold the probe is simply dropped (correct for a
+	# closed port); above it the scanner is banned.
+	chain caly_scan {
+		meta nfproto ipv4 update @caly_scan4 { ip saddr timeout 5m limit rate over 20/second burst 40 packets } jump caly_ban_add comment "port scan: probes of closed ports [caly:scan]"	#@-LEGACY@
+		meta nfproto ipv6 update @caly_scan6 { ip6 saddr timeout 5m limit rate over 20/second burst 40 packets } jump caly_ban_add comment "port scan: probes of closed ports [caly:scan]"	#@-LEGACY@
+		jump caly_drop
+	}
+
+	# Per-source new-connection rate and concurrent-connection ceiling.
+	# Mirrors CALY_TB_NEWCONN plus the conntrack pressure guard.
+	chain caly_newconn {
+		meta nfproto ipv4 update @caly_new4 { ip saddr timeout 5m limit rate over 500/second burst 1000 packets } jump caly_strike comment "new-conn flood per source [caly:newconn]"	#@-LEGACY@
+		meta nfproto ipv6 update @caly_new6 { ip6 saddr timeout 5m limit rate over 500/second burst 1000 packets } jump caly_strike comment "new-conn flood per source [caly:newconn]"	#@-LEGACY@
+		meta nfproto ipv4 add @caly_cc4 { ip saddr ct count over 200 } counter jump caly_drop comment "too many concurrent connections from one source [caly:ctcount]"	#@-LEGACY@
+		meta nfproto ipv6 add @caly_cc6 { ip6 saddr ct count over 200 } counter jump caly_drop comment "too many concurrent connections from one source [caly:ctcount]"	#@-LEGACY@
+	}
+
+	# Per-source volumetric buckets, evaluated pre-conntrack.
+	chain caly_buckets {
+		meta nfproto ipv4 update @caly_pps4 { ip saddr timeout 5m limit rate over 200000/second burst 400000 packets } jump caly_strike comment "per-source packet flood [caly:pps]"	#@-LEGACY@
+		meta nfproto ipv6 update @caly_pps6 { ip6 saddr timeout 5m limit rate over 200000/second burst 400000 packets } jump caly_strike comment "per-source packet flood [caly:pps]"	#@-LEGACY@
+		meta nfproto ipv4 update @caly_bps4 { ip saddr timeout 5m limit rate over 250000000 bytes/second burst 500000000 bytes } jump caly_strike comment "per-source bandwidth flood [caly:bps]"	#@-LEGACY@
+		meta nfproto ipv6 update @caly_bps6 { ip6 saddr timeout 5m limit rate over 250000000 bytes/second burst 500000000 bytes } jump caly_strike comment "per-source bandwidth flood [caly:bps]"	#@-LEGACY@
+	}
+
+	# Operator extension point. Left empty on purpose; append with
+	#   nft add rule inet calyanti caly_user <your rule>
+	# It runs after the mgmt accept and before any volumetric rule.
+	chain caly_user {
+	}
+
+	# Per-port rate limits. apply.sh appends two rules per rate-limited
+	# port: a conforming `accept` followed by a `jump caly_drop`.
+	chain caly_port_rl {
+	}
+
+	# =====================================================================
+	# caly_early - prerouting, priority -450
+	#
+	# Pre-conntrack, pre-defragmentation. This is the nftables analogue of
+	# the XDP hook: cheapest and highest-confidence checks first, nothing
+	# here allocates conntrack state.
+	# =====================================================================
+	chain caly_early {
+		type filter hook prerouting priority -450; policy accept;
+
+		# --- 0. bypass -------------------------------------------------
+		# Loopback and every LAN/DMZ/disabled interface leave immediately.
+		iifname $caly_lan_ifaces counter accept comment "zone LAN/DMZ or loopback: bypass the whole policy"
+
+		# --- 1. IPv6 neighbour/router discovery and PMTUD --------------
+		# MUST precede the bogon rules: duplicate address detection sends
+		# a neighbour solicitation from the unspecified address ::, and a
+		# router advertisement comes from a link-local address. Dropping
+		# any of these disconnects the host instead of hardening it -
+		# exactly the CALY_ICMP6_MANDATORY_INIT invariant.
+		# The hop-limit 255 test is RFC 4861 and is what stops off-link
+		# ND spoofing.
+		icmpv6 type { nd-neighbor-solicit, nd-neighbor-advert, nd-router-solicit, nd-router-advert } ip6 hoplimit 255 counter accept comment "IPv6 ND: mandatory, dropping it kills IPv6"
+		icmpv6 type packet-too-big counter accept comment "IPv6 PMTUD: dropping it black-holes large flows"
+		icmpv6 type { 130, 131, 132, 143 } ip6 saddr fe80::/10 counter accept comment "MLD from an on-link node: needed for IPv6 multicast"	#@-LEGACY@
+		icmpv6 type nd-redirect ip6 hoplimit 255 ip6 saddr fe80::/10 counter accept comment "on-link ICMPv6 redirect from a link-local router"
+		icmpv6 type nd-redirect counter jump caly_drop comment "off-link ICMPv6 redirect: route hijack"
+
+		# --- 2. anomaly drops: physically-impossible-for-legit packets -
+		# These run BEFORE the allowlist and the mgmt accept, exactly as
+		# in the XDP ladder (step 2 anomaly precedes step 3 allowlist).
+		# That is safe ONLY because none of them can ever match a real
+		# management or allowlisted packet: a genuine SSH client never
+		# sources from a bogon, never sends a NULL-flag segment, and
+		# never fragments to 1. Reputation drops (which CAN catch an
+		# admin who tripped a limit) are deferred until AFTER the mgmt
+		# accept in section 9.
+
+		# --- 2a. martian / bogon sources ------------------------------
+		# A source address that can never legitimately appear on a
+		# routed interface. Spoofed floods and reflection attacks almost
+		# always carry one of these.
+		ip saddr { 0.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16, 192.0.2.0/24, 198.18.0.0/15, 198.51.100.0/24, 203.0.113.0/24, 240.0.0.0/4 } counter jump caly_drop comment "IPv4 bogon/martian source (incl. 255.255.255.255)"
+		ip saddr 224.0.0.0/4 counter jump caly_drop comment "IPv4 multicast used as a source address"
+		ip6 saddr { ::/128, ::1/128, 0100::/64 } counter jump caly_drop comment "IPv6 unspecified / loopback / RFC6666 discard as a source"
+		ip6 saddr ff00::/8 counter jump caly_drop comment "IPv6 multicast used as a source address"
+#@+DROP_PRIVATE@ ip saddr { 10.0.0.0/8, 100.64.0.0/10, 172.16.0.0/12, 192.168.0.0/16 } counter jump caly_drop comment "RFC1918/CGNAT source on a public interface"
+#@+DROP_PRIVATE@ ip6 saddr { fc00::/7, fe80::/10 } counter jump caly_drop comment "ULA/link-local source on a public interface"
+
+		# --- 2b. self-spoof / LAND ------------------------------------
+		# A packet arriving from outside that claims one of OUR OWN
+		# addresses. Classic LAND attack and the basis of most local
+		# reflection tricks. NOTE: on a box doing hairpin NAT this can
+		# match legitimate traffic; that is why caly_local4/6 are empty
+		# until the operator sets `local =` in calyanti.conf.
+		ip saddr @caly_local4 counter jump caly_drop comment "LAND / self-spoof: source is one of our own prefixes"
+		ip6 saddr @caly_local6 counter jump caly_drop comment "LAND / self-spoof: source is one of our own prefixes"
+		fib saddr type local counter jump caly_drop comment "LAND / self-spoof: source is a locally configured address"	#@-LEGACY@
+#@+URPF@ fib saddr . iif oif missing counter jump caly_drop comment "strict uRPF: no route back out of the arrival interface"
+
+		# --- 2c. illegal TCP flag combinations ------------------------
+		# None of these can be produced by a conforming stack; they are
+		# scanner fingerprints (nmap -sN/-sF/-sX) and evasion probes.
+		# A legitimate SSH packet can never match, so this cannot lock
+		# anybody out even though it precedes the mgmt accept.
+		tcp flags & (fin|syn|rst|psh|ack|urg) == 0x0 counter jump caly_drop comment "TCP NULL scan"
+		tcp flags & (fin|syn|rst|psh|ack|urg) == fin counter jump caly_drop comment "TCP FIN scan (FIN without ACK)"
+		tcp flags & (syn|fin) == syn|fin counter jump caly_drop comment "TCP SYN+FIN: impossible combination"
+		tcp flags & (syn|rst) == syn|rst counter jump caly_drop comment "TCP SYN+RST: impossible combination"
+		tcp flags & (fin|rst) == fin|rst counter jump caly_drop comment "TCP FIN+RST: impossible combination"
+		tcp flags & (fin|psh|urg) == fin|psh|urg counter jump caly_drop comment "TCP Xmas scan"
+		tcp flags & (fin|syn|rst|psh|ack|urg|ecn|cwr) == (fin|syn|rst|psh|ack|urg|ecn|cwr) counter jump caly_drop comment "TCP all-flags scan"
+		tcp sport 0 counter jump caly_drop comment "TCP source port 0"
+		tcp dport 0 counter jump caly_drop comment "TCP destination port 0"
+		udp sport 0 counter jump caly_drop comment "UDP source port 0"
+		udp dport 0 counter jump caly_drop comment "UDP destination port 0"
+
+		# --- 2d. fragment anomalies -----------------------------------
+		# `ip frag-off & 0x1fff != 0` is a non-first fragment. Masking
+		# with 0x1fff is correct whether this nft build exposes the
+		# field as 13 bits (offset only) or as the full 16 bits.
+		ip frag-off & 0x1fff == 1 counter jump caly_drop comment "fragment offset 1: classic header-overlap evasion"
+		ip frag-off & 0x1fff != 0 ip length < 128 counter jump caly_drop comment "tiny fragment: overlap/evasion attack [caly:fragmin]"
+		meta l4proto icmp ip frag-off & 0x1fff != 0 counter jump caly_drop comment "fragmented ICMP is always hostile (ping of death)"
+		meta l4proto ipv6-icmp exthdr frag exists counter jump caly_drop comment "fragmented ICMPv6 is always hostile"	#@-LEGACY@
+#@+DROP_ALL_FRAGS@ ip frag-off & 0x1fff != 0 counter jump caly_drop comment "paranoid: all IPv4 fragments refused"
+#@+DROP_ALL_FRAGS@ ip6 nexthdr 44 counter jump caly_drop comment "paranoid: all IPv6 fragments refused"
+
+		# --- 2e. IPv6 routing header ----------------------------------
+		# RFC 5095 deprecated RH0; it turns any host into a traffic
+		# amplifier. Matches a routing header appearing as the first
+		# extension header, which is how it is always sent in practice.
+		ip6 nexthdr 43 counter jump caly_drop comment "IPv6 routing header (RFC5095 RH0 amplification)"
+
+		# --- 3. operator allowlist ------------------------------------
+		# The escape hatch. Nothing below this line can lock out a
+		# source the operator has explicitly trusted.
+		ip saddr @caly_allow4 counter accept comment "operator allowlist v4: unconditional pass"
+		ip6 saddr @caly_allow6 counter accept comment "operator allowlist v6: unconditional pass"
+
+		# --- 4. MANAGEMENT ACCEPT -------------------------------------
+		# ORDER IS LOAD BEARING: the mgmt accept precedes EVERY reputation,
+		# volumetric and policy drop (XDP ladder step 3b, before step 4).
+		# An admin whose address was auto-banned after fat-fingering a
+		# login can still reach SSH. Do not move this below section 5.
+		# (The optional SSHGUARD rule does rate-limit mgmt brute force,
+		# but only when the operator opts in, and the allowlist above
+		# always wins over it.)
+#@+SSHGUARD@ tcp dport @caly_mgmt_tcp ct state new update @caly_mgmt4 { ip saddr timeout 30m limit rate over 10/minute burst 10 packets } jump caly_ban_add comment "mgmt brute force: too many new sessions [caly:sshguard]"
+#@+SSHGUARD@ tcp dport @caly_mgmt_tcp ct state new update @caly_mgmt6 { ip6 saddr timeout 30m limit rate over 10/minute burst 10 packets } jump caly_ban_add comment "mgmt brute force: too many new sessions [caly:sshguard]"
+		tcp dport @caly_mgmt_tcp counter accept comment "management TCP (SSH etc): never dropped by any rule below"
+		udp dport @caly_mgmt_udp counter accept comment "management UDP (WireGuard etc): never dropped by any rule below"
+
+		# --- 5. static reputation -------------------------------------
+		# Deferred to here so it can never lock the operator out of a
+		# management port. A blocklisted source can still reach SSH
+		# (accepted above); everything else from it dies here.
+		# Only the STATIC operator blocklist drops pre-conntrack: it is
+		# deliberate operator intent. The DYNAMIC auto-ban is enforced in
+		# caly_input/caly_forward instead, AFTER the ct established,related
+		# fast path, so a ban installed off a spoofable per-source bucket
+		# (an attacker forging an upstream resolver/NTP/peer we depend on)
+		# can never sever our own solicited/established traffic to it.
+		ip saddr @caly_block4 counter jump caly_drop comment "static operator blocklist v4"
+		ip6 saddr @caly_block6 counter jump caly_drop comment "static operator blocklist v6"
+
+		# --- 6. operator extension point ------------------------------
+		jump caly_user
+
+		# --- 7. ICMP policy -------------------------------------------
+		# Mirrors caly_icmp4_pol. Type 3 can never be dropped: code 4 is
+		# Fragmentation Needed and dropping it black-holes PMTUD, which
+		# is the "SSH connects then hangs" failure.
+		icmp type destination-unreachable counter accept comment "ICMP unreachable: carries PMTUD, MANDATORY pass"
+		icmp type { echo-request, echo-reply } ip length > 1500 counter jump caly_drop comment "oversized ICMP: ping of death [caly:icmpsize]"
+		meta pkttype broadcast icmp type echo-request counter jump caly_drop comment "smurf: broadcast ping"
+		meta pkttype multicast icmp type echo-request counter jump caly_drop comment "smurf: multicast ping"
+		icmp type time-exceeded limit rate 50/second burst 100 packets counter accept comment "traceroute / TTL expiry, rate limited"
+		icmp type parameter-problem limit rate 20/second burst 40 packets counter accept comment "ICMP parameter problem, rate limited"
+		icmp type { redirect, source-quench, router-advertisement, router-solicitation, timestamp-request, timestamp-reply, info-request, info-reply, address-mask-request, address-mask-reply } counter jump caly_drop comment "obsolete/abusable ICMP types (redirect hijack, host discovery)"
+		icmp type echo-request meta nfproto ipv4 update @caly_icmpr4 { ip saddr timeout 5m limit rate over 200/second burst 400 packets } jump caly_strike comment "per-source ICMP flood [caly:icmp]"	#@-LEGACY@
+		icmpv6 type echo-request meta nfproto ipv6 update @caly_icmpr6 { ip6 saddr timeout 5m limit rate over 200/second burst 400 packets } jump caly_strike comment "per-source ICMPv6 flood [caly:icmp]"	#@-LEGACY@
+		icmpv6 type { echo-request, echo-reply } ip6 length > 1500 counter jump caly_drop comment "oversized ICMPv6 [caly:icmpsize]"
+		icmp type echo-request limit rate 100/second burst 200 packets counter accept comment "global ping ceiling"
+		icmp type echo-request counter jump caly_drop comment "ping flood above the global ceiling"
+		icmpv6 type echo-request limit rate 100/second burst 200 packets counter accept comment "global ping6 ceiling"
+		icmpv6 type echo-request counter jump caly_drop comment "ping6 flood above the global ceiling"
+
+		# --- 8/9. per-source volumetric, SYN and UDP buckets ----------
+		# MOVED to caly_input (post-conntrack), see the block after the
+		# ct established,related accept there. They cannot run here: this
+		# chain is pre-conntrack (prerouting -450), so it would meter and
+		# auto-ban SOLICITED established replies too - e.g. a legitimate
+		# multi-gigabit QUIC/HTTP3 download from a CDN would overflow the
+		# per-source UDP bucket, get its packets dropped, and finally see
+		# the CDN's address auto-banned. Only unsolicited (new) volume must
+		# reach the buckets, which requires the ct state available in
+		# caly_input. This mirrors the iptables fallback (CALY_BUCKETS is
+		# jumped from CALY_INPUT after the ESTABLISHED accept, never EARLY).
+
+		# --- 10. global SYN ceiling -----------------------------------
+		# The rung-4 equivalent of fw_config.syn_fallback_pps. Spoofed
+		# floods spread over millions of sources defeat any per-source
+		# bucket; this is the last line before the TCP stack. Combine
+		# with net.ipv4.tcp_syncookies=1 (or the SYNPROXY tag).
+		tcp flags & (syn|ack) == syn limit rate over 100000/second burst 200000 packets counter jump caly_drop comment "global SYN ceiling exceeded [caly:synglobal]"
+	}
+
+	# =====================================================================
+	# caly_input - input, priority 0
+	#
+	# Conntrack is available here. Everything that needs flow state lives
+	# in this chain: the established fast path, the reflection filter, the
+	# new-connection buckets and the per-port policy.
+	# =====================================================================
+	chain caly_input {
+		type filter hook input priority 0; policy accept;
+
+		iifname $caly_lan_ifaces counter accept comment "zone LAN/DMZ or loopback: bypass the whole policy"
+
+		# --- kernel SYN proxy -----------------------------------------
+		# Uses the kernel's own cookie secret (nf_synproxy_core), the
+		# same design constraint as the XDP path: never hand-roll a
+		# cookie the TCP stack cannot validate.
+		# Requires net.ipv4.tcp_syncookies=2 and tcp_timestamps=1.
+#@+SYNPROXY@ ct state invalid,untracked tcp dport @caly_synproxy_ports synproxy mss 1460 wscale 7 timestamp sack-perm comment "SYN proxy: complete the handshake in the kernel before the socket exists"
+
+		# --- conntrack fast path --------------------------------------
+		# The single most valuable rule in the file: an established flow
+		# short-circuits every check below, exactly like the conntrack
+		# hit in the XDP ladder.
+		ct state established,related counter accept comment "established/related flow: fast path"
+
+		# --- allowlist and management ---------------------------------
+		ip saddr @caly_allow4 counter accept comment "operator allowlist v4"
+		ip6 saddr @caly_allow6 counter accept comment "operator allowlist v6"
+		tcp dport @caly_mgmt_tcp counter accept comment "management TCP (SSH etc): never dropped by any rule below"
+		udp dport @caly_mgmt_udp counter accept comment "management UDP: never dropped by any rule below"
+
+		# --- IPv6 control plane, again --------------------------------
+		# These arrive as ct state NEW or INVALID and would otherwise be
+		# caught by the invalid drop below.
+		icmpv6 type { nd-neighbor-solicit, nd-neighbor-advert, nd-router-solicit, nd-router-advert } ip6 hoplimit 255 counter accept comment "IPv6 ND: mandatory"
+		icmpv6 type packet-too-big counter accept comment "IPv6 PMTUD: mandatory"
+		icmp type destination-unreachable counter accept comment "ICMP unreachable carries PMTUD: mandatory"
+
+		jump caly_user
+
+		# --- dynamic auto-ban (moved here from caly_early section 5) ---
+		# Enforced AFTER the ct established,related accept, the allowlist
+		# and the mgmt accept above, so: our own solicited/established
+		# replies from a source that was auto-banned (possibly by a
+		# spoofed flood forging its address) are already accepted and are
+		# never severed; an allowlisted peer is exempt; an auto-banned
+		# admin can still reach SSH. Static blocklists, which are operator
+		# intent, still drop pre-conntrack in caly_early.
+		ip saddr @caly_ban4 counter jump caly_drop comment "dynamic auto-ban v4 (timeout bounded)"
+		ip6 saddr @caly_ban6 counter jump caly_drop comment "dynamic auto-ban v6 (timeout bounded)"
+
+		# --- invalid state --------------------------------------------
+		# Out-of-window segments, unmatched RST/FIN storms, forged
+		# mid-stream packets. Never legitimate for inbound traffic.
+		ct state invalid counter jump caly_drop comment "conntrack INVALID: forged or out-of-window segment"
+
+		# --- unsolicited SYN-ACK --------------------------------------
+		# We never sent the SYN, so this is either a scan or the
+		# backscatter of a flood spoofing our address.
+		tcp flags & (syn|ack) == syn|ack ct state new counter jump caly_drop comment "unsolicited SYN-ACK: scan or reflected backscatter"
+
+		# --- reflection / amplification -------------------------------
+		# The reply to a query WE sent is ESTABLISHED and was accepted
+		# by the fast path far above, so anything reaching this rule
+		# with an amplifier source port is unsolicited by construction.
+		# This is what lets a real DNS/NTP server coexist with the
+		# filter: inbound queries carry dport 53, not sport 53.
+		meta l4proto udp udp sport @caly_amp_ports ct state new counter jump caly_drop comment "UDP reflection: source port is a known amplifier"
+
+		# --- per-source volumetric, SYN and UDP buckets ---------------
+		# Moved here from caly_early (sections 8/9) so they run AFTER the
+		# ct established,related accept above: solicited replies to a flow
+		# WE started (a large QUIC/HTTP3 download from a CDN, a bulk TCP
+		# transfer) are exempt and can never be metered or auto-banned as
+		# if they were an inbound flood. Only unsolicited (new) volume
+		# reaches these buckets. SYN is still identified statelessly.
+		# Mirrors the iptables CALY_BUCKETS placement.
+		jump caly_buckets
+		tcp flags & (syn|ack) == syn meta nfproto ipv4 update @caly_syn4 { ip saddr timeout 5m limit rate over 2000/second burst 4000 packets } jump caly_strike comment "per-source SYN flood [caly:syn]"	#@-LEGACY@
+		tcp flags & (syn|ack) == syn meta nfproto ipv6 update @caly_syn6 { ip6 saddr timeout 5m limit rate over 2000/second burst 4000 packets } jump caly_strike comment "per-source SYN flood [caly:syn]"	#@-LEGACY@
+		meta l4proto udp meta nfproto ipv4 update @caly_udp4 { ip saddr timeout 5m limit rate over 50000/second burst 100000 packets } jump caly_strike comment "per-source UDP flood [caly:udp]"	#@-LEGACY@
+		meta l4proto udp meta nfproto ipv6 update @caly_udp6 { ip6 saddr timeout 5m limit rate over 50000/second burst 100000 packets } jump caly_strike comment "per-source UDP flood [caly:udp]"	#@-LEGACY@
+
+		# --- per-source new-connection rate and ceiling ---------------
+		ct state new jump caly_newconn
+
+		# --- per-port rate limits (generated by apply.sh) -------------
+		jump caly_port_rl
+
+		# --- per-port policy ------------------------------------------
+		tcp dport @caly_open_tcp ct state new counter accept comment "port policy: explicitly open TCP port"
+		udp dport @caly_open_udp ct state new counter accept comment "port policy: explicitly open UDP port"
+		tcp dport @caly_closed_tcp ct state new counter jump caly_scan comment "port policy: explicitly closed TCP port (feeds scan detection)"
+		udp dport @caly_closed_udp ct state new counter jump caly_scan comment "port policy: explicitly closed UDP port (feeds scan detection)"
+
+		# --- default deny ---------------------------------------------
+		# Off by default: a firewall that silently blackholes the
+		# service you forgot to enumerate is worse than one that does
+		# not. Enable only after listing every port you serve.
+#@+DEFAULT_DENY@ meta l4proto { tcp, udp } ct state new counter jump caly_scan comment "default deny: inbound to a port that was never opened"
+	}
+
+	# =====================================================================
+	# caly_forward - forward, priority 0
+	#
+	# Routed traffic already passed caly_early (prerouting covers both
+	# local and forwarded packets), so only the stateful checks are
+	# repeated here. policy accept: we must never break a router.
+	# =====================================================================
+	chain caly_forward {
+		type filter hook forward priority 0; policy accept;
+
+		iifname $caly_lan_ifaces counter accept comment "zone LAN/DMZ or loopback: bypass"
+		ct state established,related counter accept comment "established/related flow: fast path"
+		# dynamic auto-ban past the established fast path (moved from
+		# caly_early), so a spoof-induced ban never severs an established
+		# transiting flow. Static blocklists still drop in caly_early.
+		ip saddr @caly_ban4 counter jump caly_drop comment "dynamic auto-ban v4 (timeout bounded)"
+		ip6 saddr @caly_ban6 counter jump caly_drop comment "dynamic auto-ban v6 (timeout bounded)"
+		ct state invalid counter jump caly_drop comment "conntrack INVALID on a routed flow"
+		tcp flags & (syn|ack) == syn|ack ct state new counter jump caly_drop comment "unsolicited SYN-ACK through the router"
+		meta l4proto udp udp sport @caly_amp_ports ct state new counter jump caly_drop comment "UDP reflection transiting the router"
+		ct state new jump caly_newconn
+	}
+
+	# =====================================================================
+	# Optional SYN-proxy prerouting chain (SYNPROXY tag).
+	#
+	# The inbound SYN must bypass conntrack so that the synproxy
+	# expression in caly_input sees it as `untracked`. Priority -300 is
+	# after caly_early, so a SYN that caly_early already rejected never
+	# reaches the proxy.
+	# =====================================================================
+#@+SYNPROXY@ chain caly_synproxy_raw {
+#@+SYNPROXY@ type filter hook prerouting priority -300; policy accept;
+#@+SYNPROXY@ tcp flags & (syn|ack) == syn tcp dport @caly_synproxy_ports notrack comment "SYN proxy: keep inbound SYNs out of conntrack"
+#@+SYNPROXY@ }
+}

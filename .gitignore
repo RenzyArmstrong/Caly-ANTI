@@ -1,0 +1,130 @@
+# Caly Anti - build artifacts and generated sources.
+#
+# Rule of thumb: if `make` or `scripts/build.sh` can regenerate it, it does not
+# belong in the repository. The two entries that surprise people are
+# vmlinux.h and *.skel.h - both are generated from the *running* kernel's BTF
+# and from the compiled BPF objects respectively, so a checked-in copy is stale
+# the moment someone builds on a different kernel.
+
+# ---------------------------------------------------------------------------
+# Build tree
+# ---------------------------------------------------------------------------
+/build/
+/out/
+/output/
+/.build/
+/dist/
+
+# ---------------------------------------------------------------------------
+# Compiled objects and libraries
+# ---------------------------------------------------------------------------
+*.o
+*.bpf.o
+*.lo
+*.a
+*.so
+*.so.*
+*.ko
+*.obj
+*.elf
+*.gcno
+*.gcda
+*.gcov
+
+# Dependency files emitted by -MMD -MP
+*.d
+!/debian/*.d
+
+# ---------------------------------------------------------------------------
+# Generated BPF sources
+# ---------------------------------------------------------------------------
+# CO-RE type definitions dumped from /sys/kernel/btf/vmlinux. Kernel and
+# architecture specific; regenerate, never commit.
+vmlinux.h
+/src/bpf/vmlinux.h
+
+# libbpf skeletons produced by `bpftool gen skeleton`.
+*.skel.h
+*.subskel.h
+*.lskel.h
+
+# ---------------------------------------------------------------------------
+# Linked binaries
+# ---------------------------------------------------------------------------
+/calyanti
+/calyantid
+/src/user/calyanti
+/src/user/calyantid
+/src/cli/calyanti
+
+# ---------------------------------------------------------------------------
+# Packaging output
+# ---------------------------------------------------------------------------
+*.tar.gz
+*.tar.xz
+*.tar.bz2
+*.tgz
+*.rpm
+*.deb
+*.ddeb
+*.dsc
+*.changes
+*.buildinfo
+/rpmbuild/
+/debian/calyanti/
+/debian/.debhelper/
+/debian/files
+/debian/*.substvars
+/debian/*.log
+/debian/debhelper-build-stamp
+/packaging/out/
+
+# ---------------------------------------------------------------------------
+# Vendored dependency build output (the checkout itself IS tracked, as a
+# submodule; only its build products are ignored)
+# ---------------------------------------------------------------------------
+/third_party/libbpf/src/*.o
+/third_party/libbpf/src/*.a
+/third_party/libbpf/src/staticobjs/
+/third_party/libbpf/src/sharedobjs/
+/third_party/bpftool/src/bpftool
+
+# ---------------------------------------------------------------------------
+# Python bytecode (the CLI and the watcher are Python; never ship .pyc)
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.pyo
+
+# ---------------------------------------------------------------------------
+# Editor / tooling scratch
+# ---------------------------------------------------------------------------
+*~
+*.swp
+*.swo
+*.orig
+*.rej
+*.bak
+.DS_Store
+/tags
+/TAGS
+/cscope.*
+/compile_commands.json
+/.cache/
+/.ccls-cache/
+/.clangd/
+/.vscode/
+/.idea/
+*.iml
+
+# ---------------------------------------------------------------------------
+# Runtime / test scratch that people habitually leave lying around
+# ---------------------------------------------------------------------------
+/core
+core.[0-9]*
+*.pcap
+*.pcapng
+/perf.data
+/perf.data.old
+/local.mk
+/.env

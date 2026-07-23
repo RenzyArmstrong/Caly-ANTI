@@ -1,0 +1,340 @@
+# ---------------------------------------------------------------------------
+# Caly Anti - calywatch rule set: nginx
+#
+# Format (see watcher/README.md for the full reference):
+#
+#   key = value            before the first [section]  -> file header / defaults
+#   [rule-name]            starts a rule
+#   key = value            inside a rule               -> rule property
+#   # comment              anywhere
+#
+# Rule properties:
+#   desc        free text
+#   enabled     yes/no                     (default yes)
+#   prefilter   literal substring, repeatable; ANY must be present in the line
+#               before the regexes are tried.  Pure speed optimisation.
+#   regex       repeatable; ANY may match.  MUST contain a named group holding
+#               the client address (default group name: ip).
+#   ip_group    name of the group carrying the address        (default: ip)
+#   xff_group   name of the group carrying X-Forwarded-For.  Only consulted
+#               when the *direct* peer is inside trusted_proxy.
+#   match       <group> <op> <value>, repeatable, ALL must hold.
+#               ops: ~  !~  ==  !=  >=  <=  >  <  in  !in
+#   distinct    count DISTINCT values of this group instead of occurrences
+#               (tumbling window, biases low - same philosophy as the
+#                dataplane's Bloom filter: undercount, never overban)
+#   threshold   occurrences (or distinct values) needed to fire   (default 1)
+#   window      sliding window                                    (default 60s)
+#   weight      each match counts this much                       (default 1)
+#   cooldown    minimum gap between two firings for one key   (default: window)
+#   action      ban | warn | count | ignore                       (default ban)
+#   ttl         base ban TTL for this rule            (default: global ban_ttl)
+#   reason      short tag recorded with the ban            (default: rule name)
+#   severity    0..9, informational                                (default 5)
+#   max_tracked hard cap on tracked source addresses for this rule
+#
+# LOG FORMAT ASSUMED: nginx "combined"
+#   log_format combined '$remote_addr - $remote_user [$time_local] '
+#                       '"$request" $status $body_bytes_sent '
+#                       '"$http_referer" "$http_user_agent"';
+#
+# If you sit behind Cloudflare / a load balancer, either use ngx_http_realip
+# (best - $remote_addr becomes the true client) or append
+# '"$http_x_forwarded_for"' to the log format and set trusted_proxy in
+# calywatch.conf.  A forged X-Forwarded-For NEVER becomes a ban target unless
+# the direct peer is inside trusted_proxy.
+# ---------------------------------------------------------------------------
+
+name    = nginx
+desc    = nginx access log: floods, error storms, scanners, WordPress abuse
+window  = 60s
+action  = ban
+ttl     = 15m
+
+# ---------------------------------------------------------------------------
+# Health / metrics endpoints.  This rule is action=count (observe only): it must
+# NOT be action=ignore.
+#
+# An ignore rule clears the source's counters across EVERY rule in this set, so
+# it may only key on a signal an attacker cannot produce (e.g. sshd's post-auth
+# "Accepted ..." line).  A health path is the opposite: /ping, /status, /metrics
+# are unauthenticated and reachable by anyone, and this match does not even
+# inspect the response status.  If it cleared counters, an attacker could reset
+# their own flood/scan/enum tallies to zero by interleaving a single
+# `GET /ping` and never reach any threshold - fully defeating the watcher for
+# that IP.  So we only count these hits (useful for stats); we never act on
+# them and never clear anything.
+#
+# To stop REAL health checkers / monitoring from ever being banned, put their
+# addresses in calywatch.conf `allow` (the allowlist is checked before every
+# ban).  That is the correct, unforgeable mechanism.
+# ---------------------------------------------------------------------------
+[nginx-ignore-health]
+desc      = observe health / metrics endpoints (count only, never clears counters)
+action    = count
+severity  = 0
+prefilter = "
+regex     = ^(?P<ip>[0-9A-Fa-f:.]{3,45})\s+\S+\s+\S+\s+\[[^\]]{1,64}\]\s+"(?P<method>[A-Z_-]{3,10})\s+(?P<path>[^"\s]{1,2048})
+match     = path ~ ^/(?:healthz?|ping|status|metrics|nginx_status|server-status)(?:[/?]|$)
+match     = method in GET,HEAD
+
+# ---------------------------------------------------------------------------
+# Request flood.  Counts EVERY logged request from one address.
+#
+# ### TIGHTEN ### 600 requests in 10 s is deliberately generous so a busy site
+# with images and XHR does not self-ban on day one.  Watch calywatch's
+# `would-ban` output in dry_run mode for a week, then set this to about 4x
+# your observed p99 per-client burst.
+# ---------------------------------------------------------------------------
+[nginx-request-flood]
+desc      = HTTP request flood from a single source
+prefilter = "
+regex     = ^(?P<ip>[0-9A-Fa-f:.]{3,45})\s+\S+\s+\S+\s+\[[^\]]{1,64}\]\s+"(?P<method>[A-Z_-]{3,10})\s+(?P<path>[^"\s]{1,2048})(?:\s+HTTP/(?P<ver>[0-9.]{1,4}))?"\s+(?P<status>\d{3})\s+(?P<size>\d+|-)(?:\s+"(?P<referer>[^"]{0,2048})"\s+"(?P<ua>[^"]{0,1024})")?(?:\s+"(?P<xff>[^"]{0,512})")?
+xff_group = xff
+threshold = 600
+window    = 10s
+ttl       = 10m
+reason    = http-flood
+severity  = 6
+
+# ---------------------------------------------------------------------------
+# 4xx storm.  A client hammering not-found / forbidden is enumerating, not
+# browsing.  404 and 403 dominate; 400 is included because malformed-request
+# floods land there.
+# ---------------------------------------------------------------------------
+[nginx-4xx-storm]
+desc      = 4xx error storm (enumeration / broken bot)
+prefilter = "
+regex     = ^(?P<ip>[0-9A-Fa-f:.]{3,45})\s+\S+\s+\S+\s+\[[^\]]{1,64}\]\s+"(?P<method>[A-Z_-]{3,10})\s+(?P<path>[^"\s]{1,2048})(?:\s+HTTP/(?P<ver>[0-9.]{1,4}))?"\s+(?P<status>\d{3})
+threshold = 80
+window    = 60s
+ttl       = 30m
+reason    = http-4xx-storm
+severity  = 6
+match     = status ~ ^4(?:0[0-9]|1[0-8]|2[0-9]|29)$
+match     = status !~ ^40[18]$
+
+# ---------------------------------------------------------------------------
+# 5xx storm.  Usually OUR fault, so the threshold is high and the TTL short:
+# we would rather blunt an exploitation attempt than ban a customer during an
+# outage.  Set action = warn if your backend is flaky.
+# ---------------------------------------------------------------------------
+[nginx-5xx-storm]
+desc      = 5xx storm from one source (exploit attempts / backend abuse)
+prefilter = "
+regex     = ^(?P<ip>[0-9A-Fa-f:.]{3,45})\s+\S+\s+\S+\s+\[[^\]]{1,64}\]\s+"(?P<method>[A-Z_-]{3,10})\s+(?P<path>[^"\s]{1,2048})(?:\s+HTTP/(?P<ver>[0-9.]{1,4}))?"\s+(?P<status>\d{3})
+threshold = 120
+window    = 60s
+ttl       = 10m
+reason    = http-5xx-storm
+severity  = 4
+match     = status ~ ^5\d\d$
+
+# ---------------------------------------------------------------------------
+# Slowloris, detectable on a STOCK combined log.
+#
+# nginx answers a stalled request with 408 (client_header_timeout /
+# client_body_timeout) and logs 499 when the client vanishes mid-request.  A
+# handful is normal on mobile networks; dozens from one address inside a
+# minute is a connection-exhaustion attack.
+#
+# There is also [nginx-slowloris-rt] below which is exact but needs a custom
+# log_format.
+# ---------------------------------------------------------------------------
+[nginx-slowloris]
+desc      = many timed-out / abandoned requests: slowloris style exhaustion
+prefilter = "
+regex     = ^(?P<ip>[0-9A-Fa-f:.]{3,45})\s+\S+\s+\S+\s+\[[^\]]{1,64}\]\s+"(?P<method>[A-Z_-]{3,10})\s+(?P<path>[^"\s]{1,2048})(?:\s+HTTP/(?P<ver>[0-9.]{1,4}))?"\s+(?P<status>\d{3})
+threshold = 25
+window    = 60s
+ttl       = 30m
+reason    = slowloris
+severity  = 7
+match     = status in 408,499,400
+
+# ---------------------------------------------------------------------------
+# Exact slowloris detection.  ENABLE THIS after adding $request_time:
+#
+#   log_format calytimed '$remote_addr - $remote_user [$time_local] '
+#                        '"$request" $status $body_bytes_sent '
+#                        '"$http_referer" "$http_user_agent" rt=$request_time';
+#   access_log /var/log/nginx/access.log calytimed;
+#
+# Then a request that occupied a worker for >= 20 s counts once; 10 of them
+# inside 2 minutes is a deliberate hold-open attack.
+# ---------------------------------------------------------------------------
+[nginx-slowloris-rt]
+desc      = requests held open for >= 20 s (needs $request_time in log_format)
+enabled   = no
+prefilter = rt=
+regex     = ^(?P<ip>[0-9A-Fa-f:.]{3,45})\s+.*\srt=(?P<rt>\d{1,6}(?:\.\d{1,6})?)\s*$
+match     = rt >= 20
+threshold = 10
+window    = 120s
+ttl       = 1h
+reason    = slowloris-rt
+severity  = 8
+
+# ---------------------------------------------------------------------------
+# Path scanning: many DISTINCT paths that all 404/403.  Distinct counting is a
+# tumbling window and undercounts on collision, which biases towards not
+# banning.
+# ---------------------------------------------------------------------------
+[nginx-path-scan]
+desc      = distinct-path scanning (dirbuster / gobuster / nuclei style)
+prefilter = "
+regex     = ^(?P<ip>[0-9A-Fa-f:.]{3,45})\s+\S+\s+\S+\s+\[[^\]]{1,64}\]\s+"(?P<method>[A-Z_-]{3,10})\s+(?P<path>[^"\s]{1,2048})(?:\s+HTTP/(?P<ver>[0-9.]{1,4}))?"\s+(?P<status>\d{3})
+distinct  = path
+match     = status in 403,404,410,451
+threshold = 40
+window    = 120s
+ttl       = 2h
+reason    = http-path-scan
+severity  = 7
+
+# ---------------------------------------------------------------------------
+# Unambiguously hostile request paths.  Three hits and you are out: no real
+# browser ever asks for /.env or /vendor/phpunit/.../eval-stdin.php.
+# ---------------------------------------------------------------------------
+[nginx-suspicious-path]
+desc      = probes for secrets, backups, admin panels and known RCE endpoints
+prefilter = "
+regex     = ^(?P<ip>[0-9A-Fa-f:.]{3,45})\s+\S+\s+\S+\s+\[[^\]]{1,64}\]\s+"(?P<method>[A-Z_-]{3,10})\s+(?P<path>[^"\s]{1,2048})
+match     = path ~ (?i)(?:/\.env|/\.git/|/\.svn/|/\.hg/|/\.aws/|/\.ssh/|/\.DS_Store|/\.htpasswd|/vendor/phpunit|/eval-stdin\.php|/phpmyadmin|/pma/|/myadmin|/adminer\.php|/wp-config\.php|/config\.php\.bak|/\.env\.bak|/backup\.(?:sql|zip|tar\.gz)|/db\.sql|/dump\.sql|/actuator/(?:env|heapdump|gateway)|/solr/admin|/console/|/manager/html|/jmx-console|/cgi-bin/|/boaform/|/HNAP1|/GponForm|/setup\.cgi|/shell\?|/\?XDEBUG_SESSION_START|/api/jsonws/invoke|/druid/index\.html|/telescope/requests|/_ignition/execute-solution|/aws/credentials|/server-info)
+threshold = 3
+window    = 300s
+ttl       = 6h
+reason    = http-suspicious-path
+severity  = 8
+
+# ---------------------------------------------------------------------------
+# Traversal / injection markers in the request line.  These are encoded forms
+# too, because the log records the raw request.
+# ---------------------------------------------------------------------------
+[nginx-traversal]
+desc      = path traversal and null-byte / injection markers in the URI
+prefilter = "
+regex     = ^(?P<ip>[0-9A-Fa-f:.]{3,45})\s+\S+\s+\S+\s+\[[^\]]{1,64}\]\s+"(?P<method>[A-Z_-]{3,10})\s+(?P<path>[^"\s]{1,2048})
+match     = path ~ (?i)(?:\.\./|%2e%2e[/%5c]|%252e%252e|/etc/passwd|/proc/self/environ|%00|\bunion\s+select\b|%27\s*or\s*%27|\bsleep\(\d|\bbenchmark\(|<script|%3cscript|\$\{jndi:|\bwget\s+http|\bcurl\s+-)
+threshold = 2
+window    = 300s
+ttl       = 12h
+reason    = http-injection
+severity  = 9
+
+# ---------------------------------------------------------------------------
+# WordPress: xmlrpc.php.  system.multicall turns one request into hundreds of
+# password guesses, and xmlrpc is also a pingback reflection amplifier.  If you
+# do not use the Jetpack/mobile apps, block it in nginx outright and this rule
+# becomes belt and braces.
+# ---------------------------------------------------------------------------
+[nginx-wp-xmlrpc]
+desc      = WordPress xmlrpc.php abuse (multicall brute force / pingback DDoS)
+prefilter = xmlrpc.php
+regex     = ^(?P<ip>[0-9A-Fa-f:.]{3,45})\s+\S+\s+\S+\s+\[[^\]]{1,64}\]\s+"(?P<method>[A-Z_-]{3,10})\s+(?P<path>[^"\s]{1,2048})
+match     = path ~ (?i)/xmlrpc\.php
+threshold = 5
+window    = 120s
+ttl       = 2h
+reason    = wp-xmlrpc
+severity  = 7
+
+# ---------------------------------------------------------------------------
+# WordPress: wp-login.php / wp-admin brute force.  Only POST counts; a human
+# fat-fingering a password does not POST fifteen times a minute.
+# ---------------------------------------------------------------------------
+[nginx-wp-login]
+desc      = WordPress login brute force
+prefilter = wp-login.php
+regex     = ^(?P<ip>[0-9A-Fa-f:.]{3,45})\s+\S+\s+\S+\s+\[[^\]]{1,64}\]\s+"(?P<method>[A-Z_-]{3,10})\s+(?P<path>[^"\s]{1,2048})
+match     = path ~ (?i)/wp-login\.php
+match     = method == POST
+threshold = 12
+window    = 180s
+ttl       = 2h
+reason    = wp-login-brute
+severity  = 7
+
+# ---------------------------------------------------------------------------
+# WordPress: user enumeration via ?author=N and the REST users endpoint.
+# ---------------------------------------------------------------------------
+[nginx-wp-enum]
+desc      = WordPress user enumeration
+prefilter = "
+regex     = ^(?P<ip>[0-9A-Fa-f:.]{3,45})\s+\S+\s+\S+\s+\[[^\]]{1,64}\]\s+"(?P<method>[A-Z_-]{3,10})\s+(?P<path>[^"\s]{1,2048})
+match     = path ~ (?i)(?:[?&]author=\d|/wp-json/wp/v2/users|/\?rest_route=/wp/v2/users)
+threshold = 8
+window    = 300s
+ttl       = 1h
+reason    = wp-user-enum
+severity  = 5
+
+# ---------------------------------------------------------------------------
+# Hostile tooling identifying itself in the User-Agent.  Deliberately does NOT
+# list curl, wget, python-requests or Go-http-client: those are used by real
+# integrations and banning them breaks customers.
+# ---------------------------------------------------------------------------
+[nginx-bad-agent]
+desc      = self-identifying attack tooling in the User-Agent
+prefilter = "
+regex     = ^(?P<ip>[0-9A-Fa-f:.]{3,45})\s+\S+\s+\S+\s+\[[^\]]{1,64}\]\s+"[A-Z_-]{3,10}\s+[^"\s]{1,2048}[^"]{0,32}"\s+\d{3}\s+(?:\d+|-)\s+"[^"]{0,2048}"\s+"(?P<ua>[^"]{0,1024})"
+match     = ua ~ (?i)\b(?:sqlmap|nikto|nessus|acunetix|arachni|w3af|dirbuster|gobuster|feroxbuster|wfuzz|ffuf|nuclei|masscan|zgrab|zmeu|nmap\s+scripting|whatweb|wpscan|hydra|medusa|xmlrpc\s+bruteforcer|CensysInspect|Odin|internetmeasurement|l9tcpid|l9explore)\b
+threshold = 1
+window    = 60s
+ttl       = 24h
+reason    = http-bad-agent
+severity  = 9
+
+# ---------------------------------------------------------------------------
+# Empty or single-character User-Agent on a POST.  Real clients always send
+# one; scripted credential stuffing frequently does not.  Threshold is high so
+# a legitimate API client without a UA is not caught by accident.
+# ---------------------------------------------------------------------------
+[nginx-empty-agent-post]
+desc      = POST flood with an empty User-Agent
+enabled   = no
+prefilter = "
+regex     = ^(?P<ip>[0-9A-Fa-f:.]{3,45})\s+\S+\s+\S+\s+\[[^\]]{1,64}\]\s+"(?P<method>[A-Z_-]{3,10})\s+[^"\s]{1,2048}[^"]{0,32}"\s+\d{3}\s+(?:\d+|-)\s+"[^"]{0,2048}"\s+"(?P<ua>[^"]{0,1024})"
+match     = method == POST
+match     = ua in -,,
+threshold = 30
+window    = 60s
+ttl       = 1h
+reason    = http-empty-agent
+severity  = 4
+
+# ---------------------------------------------------------------------------
+# nginx error_log rules.  Point a source at /var/log/nginx/error.log to use
+# these; they are inert against an access log.
+#
+#   2026/07/23 20:02:13 [error] 1234#0: *5 limit_req ..., client: 1.2.3.4, ...
+# ---------------------------------------------------------------------------
+[nginx-limit-req]
+desc      = nginx's own limit_req/limit_conn zone rejected this client
+prefilter = client:
+regex     = \[(?:error|crit)\][^,]{0,256}(?:limiting requests|limiting connections)[^,]{0,256},\s+client:\s+(?P<ip>[0-9A-Fa-f:.]{3,45})
+threshold = 40
+window    = 60s
+ttl       = 30m
+reason    = nginx-limit-req
+severity  = 6
+
+[nginx-error-storm]
+desc      = client triggering large numbers of nginx errors (buffer/SSL/upstream)
+prefilter = client:
+regex     = \[(?:error|crit|alert)\][^\n]{0,512}?client:\s+(?P<ip>[0-9A-Fa-f:.]{3,45})
+threshold = 150
+window    = 60s
+ttl       = 20m
+reason    = nginx-error-storm
+severity  = 4
+
+[nginx-ssl-abuse]
+desc      = repeated TLS handshake failures (renegotiation / cipher probing)
+prefilter = SSL_do_handshake
+regex     = SSL_do_handshake\(\)\s+failed[^\n]{0,256}?client:\s+(?P<ip>[0-9A-Fa-f:.]{3,45})
+threshold = 60
+window    = 60s
+ttl       = 1h
+reason    = tls-handshake-abuse
+severity  = 6

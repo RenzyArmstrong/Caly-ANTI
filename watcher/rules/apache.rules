@@ -1,0 +1,264 @@
+# ---------------------------------------------------------------------------
+# Caly Anti - calywatch rule set: Apache httpd
+#
+# Rule file syntax is documented at the top of nginx.rules and in full in
+# watcher/README.md.
+#
+# LOG FORMATS ASSUMED
+#
+#   access log ("combined", the default on Debian/Ubuntu and RHEL):
+#     LogFormat "%h %l %u %t \"%r\" %>s %O \"%{Referer}i\" \"%{User-Agent}i\"" combined
+#     1.2.3.4 - - [23/Jul/2026:20:02:13 +0000] "GET /x HTTP/1.1" 200 512 "-" "curl/8"
+#
+#   Debian/Ubuntu other_vhosts_access.log prefixes every line with the vhost:
+#     example.com:443 1.2.3.4 - - [23/Jul/2026:20:02:13 +0000] "GET / HTTP/1.1" ...
+#   The regexes below tolerate that prefix.
+#
+#   error log (2.4):
+#     [Wed Jul 23 20:02:13.123456 2026] [core:error] [pid 123:tid 140] \
+#       [client 1.2.3.4:53124] AH00037: Symbolic link not allowed ...
+#
+# BEHIND A PROXY: prefer mod_remoteip (RemoteIPHeader X-Forwarded-For +
+# RemoteIPTrustedProxy) so %h is already the real client.  Otherwise log
+# \"%{X-Forwarded-For}i\" and set trusted_proxy in calywatch.conf; a forged
+# header is never trusted from an untrusted peer.
+# ---------------------------------------------------------------------------
+
+name    = apache
+desc    = Apache httpd access/error logs: floods, error storms, scanners
+window  = 60s
+action  = ban
+ttl     = 15m
+
+# ---------------------------------------------------------------------------
+# Health / status endpoints.  action=count (observe only), NOT action=ignore.
+#
+# action=ignore clears the source's counters across every rule in this set, so
+# it may only key on a signal an attacker cannot produce.  /status, /ping,
+# /server-status are unauthenticated and reachable by anyone (and this match does
+# not check the response status), so an ignore here would let an attacker reset
+# their own flood/scan/enum tallies with a single `GET /status` and never be
+# banned.  We only count these hits; to keep REAL probers off the ban list, put
+# their addresses in calywatch.conf `allow` (checked before every ban).
+# ---------------------------------------------------------------------------
+[apache-ignore-health]
+desc      = observe health / status endpoints (count only, never clears counters)
+action    = count
+severity  = 0
+prefilter = "
+regex     = ^(?:\S{1,255}:\d{1,5}\s+)?(?P<ip>[0-9A-Fa-f:.]{3,45})\s+\S+\s+\S+\s+\[[^\]]{1,64}\]\s+"(?P<method>[A-Z_-]{3,10})\s+(?P<path>[^"\s]{1,2048})
+match     = path ~ ^/(?:healthz?|ping|status|metrics|server-status|server-info)(?:[/?]|$)
+match     = method in GET,HEAD
+
+# ---------------------------------------------------------------------------
+# ### TIGHTEN ### 600 req / 10 s is generous on purpose.  Run with dry_run for
+# a week, then set to roughly 4x your observed p99 per-client burst.
+# ---------------------------------------------------------------------------
+[apache-request-flood]
+desc      = HTTP request flood from a single source
+prefilter = "
+regex     = ^(?:\S{1,255}:\d{1,5}\s+)?(?P<ip>[0-9A-Fa-f:.]{3,45})\s+\S+\s+\S+\s+\[[^\]]{1,64}\]\s+"(?P<method>[A-Z_-]{3,10})\s+(?P<path>[^"\s]{1,2048})(?:\s+HTTP/(?P<ver>[0-9.]{1,4}))?"\s+(?P<status>\d{3})\s+(?P<size>\d+|-)(?:\s+"(?P<referer>[^"]{0,2048})"\s+"(?P<ua>[^"]{0,1024})")?(?:\s+"(?P<xff>[^"]{0,512})")?
+xff_group = xff
+threshold = 600
+window    = 10s
+ttl       = 10m
+reason    = http-flood
+severity  = 6
+
+[apache-4xx-storm]
+desc      = 4xx error storm (enumeration / broken bot)
+prefilter = "
+regex     = ^(?:\S{1,255}:\d{1,5}\s+)?(?P<ip>[0-9A-Fa-f:.]{3,45})\s+\S+\s+\S+\s+\[[^\]]{1,64}\]\s+"(?P<method>[A-Z_-]{3,10})\s+(?P<path>[^"\s]{1,2048})(?:\s+HTTP/(?P<ver>[0-9.]{1,4}))?"\s+(?P<status>\d{3})
+match     = status ~ ^4(?:0[0-9]|1[0-8]|2[0-9]|29)$
+match     = status !~ ^40[18]$
+threshold = 80
+window    = 60s
+ttl       = 30m
+reason    = http-4xx-storm
+severity  = 6
+
+[apache-5xx-storm]
+desc      = 5xx storm from one source (exploit attempts / backend abuse)
+prefilter = "
+regex     = ^(?:\S{1,255}:\d{1,5}\s+)?(?P<ip>[0-9A-Fa-f:.]{3,45})\s+\S+\s+\S+\s+\[[^\]]{1,64}\]\s+"(?P<method>[A-Z_-]{3,10})\s+(?P<path>[^"\s]{1,2048})(?:\s+HTTP/(?P<ver>[0-9.]{1,4}))?"\s+(?P<status>\d{3})
+match     = status ~ ^5\d\d$
+threshold = 120
+window    = 60s
+ttl       = 10m
+reason    = http-5xx-storm
+severity  = 4
+
+# ---------------------------------------------------------------------------
+# Slowloris.  Apache logs 408 when a request times out mid-headers, and mod_
+# reqtimeout closes with 408 as well.  Prefork/worker Apache is far more
+# vulnerable to this than nginx, so the threshold is lower.
+#
+# Also enable mod_reqtimeout (it ships enabled on Debian/RHEL) - that is the
+# actual fix; this rule bans the source so it stops consuming workers.
+# ---------------------------------------------------------------------------
+[apache-slowloris]
+desc      = repeated 408 request timeouts: slowloris style worker exhaustion
+prefilter = "
+regex     = ^(?:\S{1,255}:\d{1,5}\s+)?(?P<ip>[0-9A-Fa-f:.]{3,45})\s+\S+\s+\S+\s+\[[^\]]{1,64}\]\s+"[^"]{0,2048}"\s+(?P<status>\d{3})
+match     = status in 408,400
+threshold = 15
+window    = 60s
+ttl       = 1h
+reason    = slowloris
+severity  = 8
+
+# ---------------------------------------------------------------------------
+# Exact slowloris detection using %D (request duration in MICROseconds).
+# Add %D to the end of your LogFormat and enable this:
+#   LogFormat "%h %l %u %t \"%r\" %>s %O \"%{Referer}i\" \"%{User-Agent}i\" %D" calytimed
+# 20 s = 20000000 us.
+# ---------------------------------------------------------------------------
+[apache-slowloris-us]
+desc      = requests occupying a worker >= 20 s (needs %D in LogFormat)
+enabled   = no
+prefilter = "
+regex     = ^(?:\S{1,255}:\d{1,5}\s+)?(?P<ip>[0-9A-Fa-f:.]{3,45})\s+.*"\s+\d{3}\s+(?:\d+|-)\s+"[^"]{0,2048}"\s+"[^"]{0,1024}"\s+(?P<us>\d{1,12})\s*$
+match     = us >= 20000000
+threshold = 10
+window    = 120s
+ttl       = 1h
+reason    = slowloris-rt
+severity  = 8
+
+[apache-path-scan]
+desc      = distinct-path scanning (dirbuster / gobuster / nuclei style)
+prefilter = "
+regex     = ^(?:\S{1,255}:\d{1,5}\s+)?(?P<ip>[0-9A-Fa-f:.]{3,45})\s+\S+\s+\S+\s+\[[^\]]{1,64}\]\s+"(?P<method>[A-Z_-]{3,10})\s+(?P<path>[^"\s]{1,2048})(?:\s+HTTP/(?P<ver>[0-9.]{1,4}))?"\s+(?P<status>\d{3})
+distinct  = path
+match     = status in 403,404,410,451
+threshold = 40
+window    = 120s
+ttl       = 2h
+reason    = http-path-scan
+severity  = 7
+
+[apache-suspicious-path]
+desc      = probes for secrets, backups, admin panels and known RCE endpoints
+prefilter = "
+regex     = ^(?:\S{1,255}:\d{1,5}\s+)?(?P<ip>[0-9A-Fa-f:.]{3,45})\s+\S+\s+\S+\s+\[[^\]]{1,64}\]\s+"(?P<method>[A-Z_-]{3,10})\s+(?P<path>[^"\s]{1,2048})
+match     = path ~ (?i)(?:/\.env|/\.git/|/\.svn/|/\.hg/|/\.aws/|/\.ssh/|/\.htpasswd|/vendor/phpunit|/eval-stdin\.php|/phpmyadmin|/pma/|/myadmin|/adminer\.php|/wp-config\.php|/config\.php\.bak|/backup\.(?:sql|zip|tar\.gz)|/db\.sql|/dump\.sql|/actuator/(?:env|heapdump|gateway)|/solr/admin|/manager/html|/jmx-console|/cgi-bin/(?:test-cgi|php|luci)|/boaform/|/HNAP1|/GponForm|/setup\.cgi|/\?XDEBUG_SESSION_START|/api/jsonws/invoke|/_ignition/execute-solution|/cgi-sys/|/aws/credentials)
+threshold = 3
+window    = 300s
+ttl       = 6h
+reason    = http-suspicious-path
+severity  = 8
+
+[apache-traversal]
+desc      = path traversal, log4shell and injection markers in the URI
+prefilter = "
+regex     = ^(?:\S{1,255}:\d{1,5}\s+)?(?P<ip>[0-9A-Fa-f:.]{3,45})\s+\S+\s+\S+\s+\[[^\]]{1,64}\]\s+"(?P<method>[A-Z_-]{3,10})\s+(?P<path>[^"\s]{1,2048})
+match     = path ~ (?i)(?:\.\./|%2e%2e[/%5c]|%252e%252e|/etc/passwd|/proc/self/environ|%00|\bunion\s+select\b|\bsleep\(\d|\bbenchmark\(|<script|%3cscript|\$\{jndi:|\bwget\s+http|\bcurl\s+-)
+threshold = 2
+window    = 300s
+ttl       = 12h
+reason    = http-injection
+severity  = 9
+
+# ---------------------------------------------------------------------------
+# CVE-2021-41773 / CVE-2021-42013: the Apache 2.4.49/2.4.50 path traversal.
+# The signature is %2e in a cgi-bin or aliased path.  One attempt is enough.
+# ---------------------------------------------------------------------------
+[apache-cve-2021-41773]
+desc      = Apache 2.4.49/2.4.50 traversal + RCE probe
+prefilter = %2e
+regex     = ^(?:\S{1,255}:\d{1,5}\s+)?(?P<ip>[0-9A-Fa-f:.]{3,45})\s+\S+\s+\S+\s+\[[^\]]{1,64}\]\s+"(?P<method>[A-Z_-]{3,10})\s+(?P<path>[^"\s]{1,2048})
+match     = path ~ (?i)(?:%2e|%%32%65){1,4}[/%]
+threshold = 1
+window    = 60s
+ttl       = 24h
+reason    = apache-traversal-cve
+severity  = 9
+
+[apache-wp-xmlrpc]
+desc      = WordPress xmlrpc.php abuse (multicall brute force / pingback DDoS)
+prefilter = xmlrpc.php
+regex     = ^(?:\S{1,255}:\d{1,5}\s+)?(?P<ip>[0-9A-Fa-f:.]{3,45})\s+\S+\s+\S+\s+\[[^\]]{1,64}\]\s+"(?P<method>[A-Z_-]{3,10})\s+(?P<path>[^"\s]{1,2048})
+match     = path ~ (?i)/xmlrpc\.php
+threshold = 5
+window    = 120s
+ttl       = 2h
+reason    = wp-xmlrpc
+severity  = 7
+
+[apache-wp-login]
+desc      = WordPress login brute force
+prefilter = wp-login.php
+regex     = ^(?:\S{1,255}:\d{1,5}\s+)?(?P<ip>[0-9A-Fa-f:.]{3,45})\s+\S+\s+\S+\s+\[[^\]]{1,64}\]\s+"(?P<method>[A-Z_-]{3,10})\s+(?P<path>[^"\s]{1,2048})
+match     = path ~ (?i)/wp-login\.php
+match     = method == POST
+threshold = 12
+window    = 180s
+ttl       = 2h
+reason    = wp-login-brute
+severity  = 7
+
+[apache-bad-agent]
+desc      = self-identifying attack tooling in the User-Agent
+prefilter = "
+regex     = ^(?:\S{1,255}:\d{1,5}\s+)?(?P<ip>[0-9A-Fa-f:.]{3,45})\s+\S+\s+\S+\s+\[[^\]]{1,64}\]\s+"[A-Z_-]{3,10}\s+[^"\s]{1,2048}[^"]{0,32}"\s+\d{3}\s+(?:\d+|-)\s+"[^"]{0,2048}"\s+"(?P<ua>[^"]{0,1024})"
+match     = ua ~ (?i)\b(?:sqlmap|nikto|nessus|acunetix|arachni|w3af|dirbuster|gobuster|feroxbuster|wfuzz|ffuf|nuclei|masscan|zgrab|zmeu|whatweb|wpscan|hydra|medusa|CensysInspect|internetmeasurement|l9tcpid|l9explore)\b
+threshold = 1
+window    = 60s
+ttl       = 24h
+reason    = http-bad-agent
+severity  = 9
+
+# ---------------------------------------------------------------------------
+# error_log rules.  Attach a second source to /var/log/apache2/error.log or
+# /var/log/httpd/error_log with this same rule file; access-log rules simply
+# never match there and cost only a prefilter test.
+# ---------------------------------------------------------------------------
+[apache-auth-brute]
+desc      = HTTP basic/digest auth brute force (mod_auth AH01617/AH01618)
+prefilter = [client
+regex     = \[client\s+(?P<ip>[0-9A-Fa-f:.]{3,45})(?::\d{1,5})?\][^\n]{0,256}?(?:AH01617|AH01618|user\s+\S{1,64}(?::\s+authentication failure| not found)|password mismatch)
+threshold = 8
+window    = 300s
+ttl       = 2h
+reason    = http-auth-brute
+severity  = 7
+
+[apache-denied]
+desc      = repeated "client denied by server configuration"
+prefilter = [client
+regex     = \[client\s+(?P<ip>[0-9A-Fa-f:.]{3,45})(?::\d{1,5})?\][^\n]{0,256}?(?:AH01630|client denied by server configuration)
+threshold = 30
+window    = 120s
+ttl       = 1h
+reason    = http-denied-storm
+severity  = 6
+
+[apache-file-not-found]
+desc      = "File does not exist" storm (scanner hitting a vhost with no 404 page)
+prefilter = [client
+regex     = \[client\s+(?P<ip>[0-9A-Fa-f:.]{3,45})(?::\d{1,5})?\][^\n]{0,256}?(?:AH01276|AH00128|File does not exist|script not found or unable to stat)
+threshold = 60
+window    = 120s
+ttl       = 1h
+reason    = http-404-storm
+severity  = 5
+
+[apache-request-invalid]
+desc      = malformed request lines / oversized headers from one source
+prefilter = [client
+regex     = \[client\s+(?P<ip>[0-9A-Fa-f:.]{3,45})(?::\d{1,5})?\][^\n]{0,256}?(?:AH00565|AH00566|AH00567|request failed: (?:malformed|error reading|URI too long|request-URI too large)|invalid request-line)
+threshold = 15
+window    = 120s
+ttl       = 2h
+reason    = http-malformed
+severity  = 7
+
+[apache-ssl-abuse]
+desc      = repeated TLS handshake failures (renegotiation / cipher probing)
+prefilter = [client
+regex     = \[client\s+(?P<ip>[0-9A-Fa-f:.]{3,45})(?::\d{1,5})?\][^\n]{0,256}?(?:AH02032|AH01998|AH02042|SSL handshake|Re-negotiation handshake failed)
+threshold = 60
+window    = 60s
+ttl       = 1h
+reason    = tls-handshake-abuse
+severity  = 6

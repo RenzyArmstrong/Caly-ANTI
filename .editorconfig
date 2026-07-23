@@ -1,0 +1,92 @@
+# EditorConfig for Caly Anti - https://editorconfig.org
+#
+# Every file in this tree is consumed on Linux. LF endings are mandatory:
+# a single CR byte in a shell script produces "bad interpreter: /bin/sh^M",
+# and a CR in the BPF Makefile silently breaks recipe parsing.
+
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = tab
+indent_size = 8
+tab_width = 8
+
+# C sources and headers follow Linux kernel style: hard tabs, 8-wide, 80 cols.
+# src/bpf/common.h is the ABI contract and is formatted this way already.
+[*.{c,h}]
+indent_style = tab
+indent_size = 8
+tab_width = 8
+max_line_length = 80
+
+# Makefiles REQUIRE hard tabs for recipe lines. Never convert these to spaces.
+[{Makefile,makefile,GNUmakefile,*.mk,*.mak}]
+indent_style = tab
+indent_size = 8
+tab_width = 8
+
+# Shell scripts: tabs, matching the C style, so a heredoc can be indented
+# with <<- without surprises.
+[*.sh]
+indent_style = tab
+indent_size = 8
+tab_width = 8
+max_line_length = 100
+
+# The sample configuration is read by humans first and the parser second.
+[*.conf]
+indent_style = space
+indent_size = 4
+max_line_length = 100
+
+# nftables / iptables rulesets for the lower ladder rungs.
+[*.{nft,ipset,rules}]
+indent_style = space
+indent_size = 4
+
+# Markdown: trailing whitespace is significant (hard line break).
+[*.md]
+indent_style = space
+indent_size = 2
+trim_trailing_whitespace = false
+max_line_length = off
+
+[*.{yml,yaml,json,toml}]
+indent_style = space
+indent_size = 2
+
+# systemd units and OpenRC init scripts.
+[*.{service,socket,timer,target,mount,path}]
+indent_style = space
+indent_size = 0
+
+[*.spec]
+indent_style = space
+indent_size = 4
+
+# Debian packaging control files are whitespace sensitive.
+[debian/control]
+indent_style = space
+indent_size = 1
+trim_trailing_whitespace = false
+
+[debian/rules]
+indent_style = tab
+indent_size = 8
+
+# Generated artifacts: never reformat, never lint.
+[{vmlinux.h,*.skel.h}]
+trim_trailing_whitespace = false
+insert_final_newline = false
+max_line_length = off
+
+[LICENSE]
+trim_trailing_whitespace = false
+max_line_length = off
+
+[VERSION]
+insert_final_newline = true

@@ -1473,4 +1473,7 @@ int caly_tc_ingress(struct __sk_buff *skb)
 			  CALY_VERDICT_PASS, 0, now);
 }
 
+#ifndef CALY_LICENSE_DEFINED
+#define CALY_LICENSE_DEFINED
 char _license[] SEC("license") = "Dual BSD/GPL";
+#endif

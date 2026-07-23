@@ -2125,4 +2125,7 @@ verdict:
  * license string. "Dual BSD/GPL" satisfies the kernel check while keeping the
  * source dual licensed.
  */
+#ifndef CALY_LICENSE_DEFINED
+#define CALY_LICENSE_DEFINED
 char _license[] SEC("license") = "Dual BSD/GPL";
+#endif

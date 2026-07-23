@@ -357,4 +357,7 @@ int caly_tc_egress(struct __sk_buff *skb)
 	return TC_ACT_OK;
 }
 
+#ifndef CALY_LICENSE_DEFINED
+#define CALY_LICENSE_DEFINED
 char _license[] SEC("license") = "Dual BSD/GPL";
+#endif

@@ -93,8 +93,11 @@ SPLIT_IPV6 ?= 0
 # there, so it is NOT the default; override BPF_CPU=v3 only for a newer floor.
 BPF_CPU ?= v2
 
-BPF_SRCS := xdp_firewall.bpf.c xdp_synproxy.bpf.c tc_ingress.bpf.c tc_egress.bpf.c
-BPF_PARTIALS := $(addprefix $(OBJDIR)/,$(BPF_SRCS:.bpf.c=.bpf.o))
+# calyanti.bpf.c #includes the four program sources so the shared maps (maps.h)
+# are defined exactly once, in a single translation unit. The individual
+# program files are dependencies, not separately-compiled objects.
+BPF_MAIN     := calyanti.bpf.c
+BPF_PROGS    := xdp_firewall.bpf.c xdp_synproxy.bpf.c tc_ingress.bpf.c tc_egress.bpf.c
 BPF_OBJ      := $(OUTPUT)/calyanti.bpf.o
 BPF_FEATURES := $(OBJDIR)/caly_bpf_features.h
 
@@ -160,25 +163,21 @@ $(BPF_FEATURES): $(VMLINUX_H) | $(OBJDIR)
 	$(Q)mv -f $@.tmp $@
 
 # --------------------------------------------------------------------------
-# Partial objects. Each carries BTF (-g) so the linker and CO-RE work.
+# The single object the loader opens. calyanti.bpf.c pulls in all four program
+# sources, so one clang compile produces one object with the maps defined once
+# - no bpftool link step (which refused to merge the duplicate non-weak map
+# symbols the per-file objects each defined). -g keeps BTF for CO-RE; the
+# following llvm-strip -g drops DWARF while keeping the .BTF section.
 # --------------------------------------------------------------------------
-$(OBJDIR)/%.bpf.o: %.bpf.c $(BPF_FEATURES) $(VMLINUX_H) | $(OBJDIR)
-	$(Q)echo '  BPF     $<'
-	$(Q)$(CLANG) $(BPF_CFLAGS) -include $(BPF_FEATURES) -c $< -o $@
-
-# --------------------------------------------------------------------------
-# Link the partials into the one object the loader opens, then drop DWARF while
-# keeping .BTF (llvm-strip -g removes debug sections, not the BTF section).
-# --------------------------------------------------------------------------
-$(BPF_OBJ): $(BPF_PARTIALS) | $(OUTPUT)
-	$(Q)echo '  LINK    $@'
-	$(Q)$(BPFTOOL) gen object $@ $(BPF_PARTIALS)
+$(BPF_OBJ): $(BPFDIR)/$(BPF_MAIN) $(addprefix $(BPFDIR)/,$(BPF_PROGS)) \
+	    $(wildcard $(BPFDIR)/*.h) $(BPF_FEATURES) $(VMLINUX_H) | $(OUTPUT) $(OBJDIR)
+	$(Q)echo '  BPF     $(BPF_MAIN) -> $@'
+	$(Q)$(CLANG) $(BPF_CFLAGS) -include $(BPF_FEATURES) -c $(BPFDIR)/$(BPF_MAIN) -o $@
 	$(Q)$(LLVM_STRIP) -g $@
 
 $(OUTPUT) $(OBJDIR):
 	$(Q)mkdir -p $@
 
 clean:
-	$(Q)rm -f $(BPF_PARTIALS) $(BPF_OBJ) $(BPF_FEATURES)
-	$(Q)rm -f $(OBJDIR)/.probe_syn.c $(OBJDIR)/.probe_rb.c
+	$(Q)rm -f $(BPF_OBJ)
 	$(Q)rm -rf $(OBJDIR)

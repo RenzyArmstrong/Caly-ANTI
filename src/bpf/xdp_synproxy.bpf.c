@@ -841,4 +841,7 @@ int caly_xdp_synproxy(struct xdp_md *ctx)
 	return sp_ack_v6(ctx, cfg, &f, ip6h, th, now);
 }
 
+#ifndef CALY_LICENSE_DEFINED
+#define CALY_LICENSE_DEFINED
 char _license[] SEC("license") = "Dual BSD/GPL";
+#endif

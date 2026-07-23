@@ -504,10 +504,16 @@ const char *caly_bpf_find_object(char *buf, size_t len)
 	}
 
 	for (i = 0; dirs[i] != NULL; i++) {
+		/* Directly in the directory... */
 		if (caly_snprintf(buf, len, "%s/%s", dirs[i],
-				  CALY_BPF_OBJ_NAME) < 0)
-			continue;
-		if (caly_file_exists(buf))
+				  CALY_BPF_OBJ_NAME) >= 0 &&
+		    caly_file_exists(buf))
+			return buf;
+		/* ...or in its bpf/ subdirectory, which is where the installer
+		 * places it (BPFOBJDIR = <libdir>/bpf). */
+		if (caly_snprintf(buf, len, "%s/bpf/%s", dirs[i],
+				  CALY_BPF_OBJ_NAME) >= 0 &&
+		    caly_file_exists(buf))
 			return buf;
 	}
 

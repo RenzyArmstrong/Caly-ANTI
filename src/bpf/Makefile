@@ -87,13 +87,14 @@ OBJDIR := $(OUTPUT)/bpfobj
 VMLINUX_H  ?= $(BPFDIR)/vmlinux.h
 SPLIT_IPV6 ?= 0
 
-# BPF ISA level. v2 (kernel 4.14+) is the safe floor for the 4.18 RHEL8 kernel.
-# v3 (jmp32 / ALU32, needs 5.1+) produces tighter bytecode AND lets the verifier
-# track 32-bit value ranges cheaply - which dramatically lowers the state-space
-# complexity that pushes big programs past the verifier's budget (-E2BIG). We
-# auto-select v3 on kernel 5.4+ (where it is well supported) and fall back to v2
-# on older kernels. Override explicitly with BPF_CPU=v2 or BPF_CPU=v3.
-BPF_CPU ?= $(shell k=`uname -r 2>/dev/null`; k=$${k%%-*}; maj=$${k%%.*}; rest=$${k#*.}; min=$${rest%%.*}; case "$$maj" in ''|*[!0-9]*) maj=0;; esac; case "$$min" in ''|*[!0-9]*) min=0;; esac; if [ "$$maj" -gt 5 ]; then echo v3; elif [ "$$maj" -eq 5 ] && [ "$$min" -ge 4 ]; then echo v3; else echo v2; fi)
+# BPF ISA level. v2 (kernel 4.14+) verifies on the 4.18 RHEL8 kernel. v3 (jmp32 /
+# ALU32, needs 5.1+) is tighter and lets the verifier track 32-bit ranges more
+# cheaply, lowering the state-space complexity that trips -E2BIG. Auto-pick v3 on
+# kernel 5.x and newer, v2 on 4.x and older. Pure make (no shell case: a ')' in a
+# shell case pattern collides with $(shell ...) paren matching). Override with
+# BPF_CPU=v2 or BPF_CPU=v3 on the make command line.
+CALY_KMAJ := $(firstword $(subst ., ,$(shell uname -r 2>/dev/null)))
+BPF_CPU ?= $(if $(filter 5 6 7 8 9 10,$(CALY_KMAJ)),v3,v2)
 
 # calyanti.bpf.c #includes the four program sources so the shared maps (maps.h)
 # are defined exactly once, in a single translation unit. The individual

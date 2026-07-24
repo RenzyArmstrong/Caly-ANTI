@@ -1517,7 +1517,6 @@ int caly_xdp_policy(struct xdp_md *ctx)
 	struct fw_config *cfg;
 	struct caly_scratch *sc;
 	struct pkt_ctx *pkt;
-	struct port_rule *prule = NULL;
 	struct conn_state *cs;
 
 	/* One reusable temporary big enough for the largest value we ever have
@@ -1540,10 +1539,9 @@ int caly_xdp_policy(struct xdp_md *ctx)
 	__u32 pkt_len, mode;
 	__u32 icmp_tc = 0;
 	__u32 icmp_policy = CALY_ICMP_PASS;
-	__u32 i;
 	int act = CALY_ACT_PASS;
 	int is_wan = 0, if_monitor = 0, is_v4 = 1;
-	int ct_hit = 0, ct_missed = 0, ct_key_valid = 0;
+	int ct_missed = 0, ct_key_valid = 0;
 	int is_syn = 0, is_icmp = 0, want_event = 0;
 	int ban_deferred = 0;
 	long err;
@@ -1970,7 +1968,12 @@ int caly_xdp_policy(struct xdp_md *ctx)
 				caly_stat(STAT_CT_UPDATED, pkt_len);
 
 				if (cs->state != CALY_CT_CLOSED) {
-					ct_hit = 1;
+					/* Established flow: the CT_HIT pkt flag is set
+					 * for downstream visibility, then we short-
+					 * circuit straight to the verdict. Stages 6-11
+					 * (caly_xdp_action) are never reached, so no
+					 * ct_hit local is carried - it is implicitly 0
+					 * there. */
 					pkt->flags |= CALY_PKT_F_CT_HIT;
 					caly_stat(STAT_CT_HIT, pkt_len);
 					reason = STAT_PASS_CONNTRACK;
@@ -2044,6 +2047,225 @@ int caly_xdp_policy(struct xdp_md *ctx)
 		act = CALY_ACT_DROP;
 		goto verdict;
 	}
+
+	/* ---- Hand off to caly_xdp_action for stages 6-11 + verdict ----
+	 *
+	 * Every rule above either returned via `goto verdict` or falls through
+	 * here with reason/act/want_event/evval/ban_ttl still at their defaults
+	 * and ct_hit == 0 (an established flow would have short-circuited above).
+	 * The only state stages 6-11 need that is NOT reconstructible from sc->pkt
+	 * is the pair of conntrack booleans, carried through the scratch map.
+	 * Splitting here is what keeps each half inside the verifier's complexity
+	 * budget: stage 2-5's map-lookup chain never enters the action half's
+	 * state space. */
+	sc->carry_ct_missed    = (__u8)ct_missed;
+	sc->carry_ct_key_valid = (__u8)ct_key_valid;
+	bpf_tail_call(ctx, &caly_progs, CALY_PROG_IDX_ACTION);
+
+	/* Only reached if the ACTION slot is empty or the tail-call depth limit
+	 * was hit - neither happens in a correctly loaded object. Fail open into
+	 * the verdict so a missing tail-call target never black-holes traffic. */
+	caly_stat(STAT_TAILCALL_FAIL, pkt_len);
+
+	if (reason == STAT_PASS_DEFAULT && !is_wan)
+		reason = STAT_PASS_LAN_IFACE;
+
+verdict:
+	{
+		__u32 verdict_code;
+		int action;
+
+		/* Monitor mode rewrites the verdict but keeps the reason, so
+		 * `calyanti-cli stats` shows exactly what WOULD have been
+		 * dropped before the operator commits to dropping it. */
+		if (act == CALY_ACT_DROP &&
+		    ((flags & CALY_F_MONITOR_ONLY) ||
+		     mode == FW_MODE_MONITOR_ONLY || if_monitor)) {
+			caly_stat(STAT_MONITOR_WOULD_DROP, pkt_len);
+			act = CALY_ACT_PASS;
+			verdict_code = CALY_VERDICT_MONITOR;
+			want_event = 1;
+		} else if (act == CALY_ACT_DROP) {
+			verdict_code = CALY_VERDICT_DROP;
+			want_event = 1;
+		} else if (act == CALY_ACT_TX) {
+			verdict_code = CALY_VERDICT_TX;
+			want_event = 1;
+		} else {
+			verdict_code = CALY_VERDICT_PASS;
+		}
+
+		caly_stat(STAT_PKT_TOTAL, pkt_len);
+		if (reason != STAT_PKT_TOTAL)
+			caly_stat(reason, pkt_len);
+
+		if (act == CALY_ACT_DROP) {
+			caly_stat(STAT_DROP_TOTAL, pkt_len);
+			caly_gauge(CALY_G_DROPS, 1);
+			action = XDP_DROP;
+		} else if (act == CALY_ACT_TX) {
+			caly_stat(STAT_TX_TOTAL, pkt_len);
+			action = XDP_TX;
+		} else {
+			caly_stat(STAT_PASS_TOTAL, pkt_len);
+			action = XDP_PASS;
+		}
+
+		caly_gauge(CALY_G_PKTS, 1);
+		caly_gauge(CALY_G_BYTES, pkt_len);
+		if (is_syn)
+			caly_gauge(CALY_G_SYN, 1);
+		if (is_syn && ct_missed)
+			caly_gauge(CALY_G_NEWCONN, 1);
+		if (pkt->proto == CALY_IPPROTO_UDP)
+			caly_gauge(CALY_G_UDP, 1);
+		if (is_icmp)
+			caly_gauge(CALY_G_ICMP, 1);
+		if (pkt->flags & CALY_PKT_F_FRAG)
+			caly_gauge(CALY_G_FRAG, 1);
+
+		if ((flags & CALY_F_SRC_STATS) && pkt->family) {
+			struct src_stats *ss;
+
+			if (is_v4)
+				ss = bpf_map_lookup_elem(&caly_top4, &skey4);
+			else
+				ss = bpf_map_lookup_elem(&caly_top6, &skey6);
+
+			if (ss) {
+				ss->packets += 1;
+				ss->bytes += pkt_len;
+				ss->last_seen_ns = now;
+				if (verdict_code == CALY_VERDICT_DROP ||
+				    verdict_code == CALY_VERDICT_MONITOR) {
+					ss->drops += 1;
+					ss->drop_bytes += pkt_len;
+					ss->last_reason = reason;
+				}
+			} else {
+				__builtin_memset(&tv.ts, 0, sizeof(tv.ts));
+				tv.ts.packets = 1;
+				tv.ts.bytes = pkt_len;
+				tv.ts.first_seen_ns = now;
+				tv.ts.last_seen_ns = now;
+				tv.ts.last_reason = reason;
+				if (verdict_code == CALY_VERDICT_DROP ||
+				    verdict_code == CALY_VERDICT_MONITOR) {
+					tv.ts.drops = 1;
+					tv.ts.drop_bytes = pkt_len;
+				}
+
+				if (is_v4)
+					err = bpf_map_update_elem(&caly_top4,
+								  &skey4,
+								  &tv.ts,
+								  BPF_ANY);
+				else
+					err = bpf_map_update_elem(&caly_top6,
+								  &skey6,
+								  &tv.ts,
+								  BPF_ANY);
+				if (err)
+					caly_stat(STAT_MAP_FULL_SRCSTAT, pkt_len);
+			}
+		}
+
+		return action;
+	}
+}
+
+/* =========================================================================
+ * caly_xdp_action - stages 6 through 11 plus the shared verdict.
+ *
+ * Reached by a tail call from caly_xdp_policy after the lockdown gate. It runs
+ * from a clean verifier state - none of the stage 2-5 map-lookup chain or the
+ * parser's packet-pointer range tracking is carried in - which is what keeps
+ * this half inside the verifier complexity budget. Nothing here reads frame
+ * bytes; every input comes from sc->pkt and the two carried conntrack booleans
+ * (sc->carry_ct_missed / sc->carry_ct_key_valid).
+ * ========================================================================= */
+SEC("xdp")
+int caly_xdp_action(struct xdp_md *ctx)
+{
+	struct fw_config *cfg;
+	struct caly_scratch *sc;
+	struct pkt_ctx *pkt;
+	struct port_rule *prule = NULL;
+	struct conn_state *cs;
+
+	/* One reusable temporary big enough for the largest value we ever have
+	 * to build before inserting it into a map. Their lifetimes never
+	 * overlap, so a union keeps the stack far below the 512 byte limit. */
+	union {
+		struct rate_state rs;
+		struct scan_state sn;
+		struct src_stats  ts;
+	} tv;
+
+	struct in6_key skey6;
+	__u32 skey4 = 0;
+
+	__u64 flags, now, ban_ttl = 0, evval = 0;
+	__u32 zero = 0, key32;
+	__u32 reason = STAT_PASS_DEFAULT;
+	__u32 pkt_len, mode;
+	__u32 i;
+	int act = CALY_ACT_PASS;
+	int is_wan = 0, if_monitor = 0, is_v4 = 1;
+	int ct_hit = 0, ct_missed = 0, ct_key_valid = 0;
+	int is_syn = 0, is_icmp = 0, want_event = 0;
+	long err;
+
+	cfg = bpf_map_lookup_elem(&caly_config, &zero);
+	if (!cfg) {
+		caly_stat(STAT_PKT_TOTAL, 0);
+		caly_stat(STAT_CONFIG_MISSING, 0);
+		caly_stat(STAT_PASS_TOTAL, 0);
+		return XDP_PASS;
+	}
+
+	sc = bpf_map_lookup_elem(&caly_scratch, &zero);
+	if (!sc) {
+		caly_stat(STAT_PKT_TOTAL, 0);
+		caly_stat(STAT_SCRATCH_FAIL, 0);
+		caly_stat(STAT_PASS_TOTAL, 0);
+		return XDP_PASS;
+	}
+
+	pkt = &sc->pkt;
+	flags = cfg->flags;
+	mode = cfg->mode;
+	now = pkt->ts_ns;
+	pkt_len = pkt->pkt_len;
+
+	/* Carried across the tail call from caly_xdp_policy. is_wan / if_monitor
+	 * originate in the parser half; ct_missed / ct_key_valid in stage 5.
+	 * ct_hit is always 0 here (an established flow returned from
+	 * caly_xdp_policy before this tail call) and is kept only so the
+	 * amplification gate below reads identically to the pre-split monolith. */
+	is_wan       = sc->carry_is_wan;
+	if_monitor   = sc->carry_if_monitor;
+	ct_missed    = sc->carry_ct_missed;
+	ct_key_valid = sc->carry_ct_key_valid;
+
+	/* skey6 must be fully zeroed before use: for IPv4 only skey4 carries the
+	 * address and skey6 stays zero, and a hash key with uninitialised padding
+	 * is both a verifier error on 4.18 and a silent lookup miss. */
+	__builtin_memset(&skey6, 0, sizeof(skey6));
+
+	is_v4 = (pkt->family == CALY_AF_INET);
+	is_icmp = (pkt->proto == CALY_IPPROTO_ICMP ||
+		   pkt->proto == CALY_IPPROTO_ICMPV6);
+	is_syn = (pkt->proto == CALY_IPPROTO_TCP) &&
+		 ((pkt->tcp_flags & CALY_TCP_SYN) != 0) &&
+		 ((pkt->tcp_flags & CALY_TCP_ACK) == 0);
+
+	/* Per-source map key, rebuilt from the already-parsed source address and
+	 * reused by every per-source lookup below, exactly as in caly_xdp_policy. */
+	if (is_v4)
+		skey4 = pkt->saddr[0];
+	else
+		__builtin_memcpy(skey6.a, pkt->saddr, sizeof(skey6.a));
 
 	/* ---- Stage 6: reflection / amplification ----
 	 *

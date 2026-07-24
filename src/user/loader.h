@@ -153,7 +153,8 @@ struct caly_bpf {
 
 	int   prog_fd_main;
 	int   prog_fd_parse;         /* REQUIRED L3/L4 parse tail-call target */
-	int   prog_fd_policy;        /* REQUIRED stage 2+ tail-call target   */
+	int   prog_fd_policy;        /* REQUIRED stage 2-5 tail-call target  */
+	int   prog_fd_action;        /* REQUIRED stage 6+ tail-call target   */
 	int   prog_fd_synproxy;
 	int   prog_fd_ipv6;
 	int   prog_fd_tc_egress;

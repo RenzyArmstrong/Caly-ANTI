@@ -183,8 +183,9 @@
 /* BPF program (C function) names, for bpf_object__find_program_by_name(). */
 #define CALY_PROG_XDP_MAIN      "caly_xdp_main"
 #define CALY_PROG_XDP_SYNPROXY  "caly_xdp_synproxy"
-#define CALY_PROG_XDP_POLICY    "caly_xdp_policy"  /* stage 2+ tail-call half */
+#define CALY_PROG_XDP_POLICY    "caly_xdp_policy"  /* stage 2-5 tail-call half */
 #define CALY_PROG_XDP_PARSE     "caly_xdp_parse"   /* L3/L4 parse tail-call   */
+#define CALY_PROG_XDP_ACTION    "caly_xdp_action"  /* stage 6+ tail-call half */
 #define CALY_PROG_XDP_IPV6      "caly_xdp_ipv6"
 #define CALY_PROG_TC_INGRESS    "caly_tc_ingress"  /* clsact ingress, rung 3 */
 #define CALY_PROG_TC_EGRESS     "caly_tc_egress"
@@ -338,7 +339,8 @@ enum caly_prog_idx {
 	CALY_PROG_IDX_IPV6     = 1,
 	CALY_PROG_IDX_POLICY   = 2,
 	CALY_PROG_IDX_PARSE    = 3,
-	CALY_PROG_IDX_MAX      = 4,
+	CALY_PROG_IDX_ACTION   = 4,
+	CALY_PROG_IDX_MAX      = 5,
 };
 
 /* Reason why a ban was installed / how it was installed. ban_entry.flags. */
@@ -907,15 +909,19 @@ struct caly_scratch {
 	 * carry_l3_proto) plus the interface WAN/monitor decision and per-iface
 	 * flags (which fold in the zone lookup). parse -> policy: the ICMP
 	 * type/code word (carry_icmp_tc), the interface decision carried onward
-	 * unchanged. BPF-internal only, never touched by userspace, so growing the
-	 * struct here is safe. Kept 8-byte aligned by carry_pad. */
+	 * unchanged. policy -> action: the two conntrack booleans (carry_ct_missed
+	 * / carry_ct_key_valid) that stages 6-11 cannot rebuild from pkt. BPF-
+	 * internal only, never touched by userspace, so growing the struct here is
+	 * safe. Kept 8-byte aligned by carry_pad. */
 	__u64             carry_if_flags;
 	__u32             carry_icmp_tc;
 	__u32             carry_l3_off;
 	__u16             carry_l3_proto;
 	__u8              carry_is_wan;
 	__u8              carry_if_monitor;
-	__u8              carry_pad[4];
+	__u8              carry_ct_missed;      /* policy -> action */
+	__u8              carry_ct_key_valid;   /* policy -> action */
+	__u8              carry_pad[2];
 };
 
 /* -------------------------------------------------------------------------

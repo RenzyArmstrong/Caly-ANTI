@@ -75,8 +75,14 @@
  * ------------------------------------------------------------------------- */
 
 #define CALY_VLAN_MAX_DEPTH     2u    /* 802.1Q + 802.1ad QinQ                */
-#define CALY_IP6_EXT_MAX        8u    /* IPv6 extension headers walked        */
-#define CALY_TUNNEL_MAX_DEPTH   1u    /* one level of IPIP/IP6IP6/GRE         */
+/* IPv6 ext-header walk depth. 4 covers essentially all real traffic; it was 8,
+ * but each extra iteration multiplies the XDP verifier's state space, and 8 is
+ * a large part of why caly_xdp_main overran the complexity budget (-E2BIG). */
+#define CALY_IP6_EXT_MAX        4u    /* IPv6 extension headers walked        */
+/* Tunnel decap depth. 0 = inspect the outer header only; this drops the second
+ * caly_parse_l3 pass, the single biggest state-space multiplier in the parser.
+ * Re-enable (1) once caly_xdp_main is split across a tail call. */
+#define CALY_TUNNEL_MAX_DEPTH   0u    /* IPIP/IP6IP6/GRE inner inspection off  */
 #define CALY_MGMT_PORTS_MAX     16u   /* mgmt allowlist slots, per protocol   */
 #define CALY_CFG_RESERVED       24u   /* fw_config future-proofing headroom   */
 

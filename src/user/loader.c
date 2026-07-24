@@ -1106,6 +1106,8 @@ static int caly_fill_prog_array(struct caly_bpf *b)
 			fd = b->prog_fd_synproxy;
 		else if (idx == CALY_PROG_IDX_IPV6)
 			fd = b->prog_fd_ipv6;
+		else if (idx == CALY_PROG_IDX_POLICY)
+			fd = b->prog_fd_policy;
 
 		if (fd >= 0) {
 			if (bpf_map_update_elem(progs_fd, &idx, &fd,
@@ -1144,6 +1146,7 @@ static int caly_load_attempt(struct caly_bpf *b,
 
 	b->obj = NULL;
 	b->prog_fd_main = -1;
+	b->prog_fd_policy = -1;
 	b->prog_fd_synproxy = -1;
 	b->prog_fd_ipv6 = -1;
 	b->prog_fd_tc_egress = -1;
@@ -1168,6 +1171,18 @@ static int caly_load_attempt(struct caly_bpf *b,
 	if (p == NULL) {
 		caly_err("BPF object has no program named '%s'",
 			 CALY_PROG_XDP_MAIN);
+		goto fail;
+	}
+
+	/* The policy half is REQUIRED, not optional: caly_xdp_main tail-calls it
+	 * to run stage 2 through the verdict, and splitting the two is what keeps
+	 * each half inside the verifier complexity budget. It autoloads by
+	 * default (a normal SEC("xdp") program); we only verify it is present so
+	 * a stripped object fails loudly here rather than silently failing open. */
+	p = bpf_object__find_program_by_name(obj, CALY_PROG_XDP_POLICY);
+	if (p == NULL) {
+		caly_err("BPF object has no program named '%s'",
+			 CALY_PROG_XDP_POLICY);
 		goto fail;
 	}
 
@@ -1256,6 +1271,16 @@ static int caly_load_attempt(struct caly_bpf *b,
 	b->prog_fd_main = (p != NULL) ? bpf_program__fd(p) : -1;
 	if (b->prog_fd_main < 0) {
 		caly_err("'%s' did not load", CALY_PROG_XDP_MAIN);
+		goto fail;
+	}
+
+	/* Required: caly_fill_prog_array() installs this fd into caly_progs slot
+	 * CALY_PROG_IDX_POLICY below, before caly_xdp_main is ever attached, so
+	 * the tail call always has a live target. */
+	p = bpf_object__find_program_by_name(obj, CALY_PROG_XDP_POLICY);
+	b->prog_fd_policy = (p != NULL) ? bpf_program__fd(p) : -1;
+	if (b->prog_fd_policy < 0) {
+		caly_err("'%s' did not load", CALY_PROG_XDP_POLICY);
 		goto fail;
 	}
 
@@ -1455,6 +1480,7 @@ int caly_bpf_open_pinned(struct caly_bpf *b, const char *pin_dir)
 	for (i = 0; i < CALY_MID_MAX; i++)
 		b->map_fd[i] = -1;
 	b->prog_fd_main = -1;
+	b->prog_fd_policy = -1;
 	b->prog_fd_synproxy = -1;
 	b->prog_fd_ipv6 = -1;
 	b->prog_fd_tc_egress = -1;
@@ -1513,6 +1539,7 @@ void caly_bpf_close(struct caly_bpf *b)
 	}
 
 	b->prog_fd_main = -1;
+	b->prog_fd_policy = -1;
 	b->prog_fd_synproxy = -1;
 	b->prog_fd_ipv6 = -1;
 	b->prog_fd_tc_egress = -1;

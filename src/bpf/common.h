@@ -183,6 +183,7 @@
 /* BPF program (C function) names, for bpf_object__find_program_by_name(). */
 #define CALY_PROG_XDP_MAIN      "caly_xdp_main"
 #define CALY_PROG_XDP_SYNPROXY  "caly_xdp_synproxy"
+#define CALY_PROG_XDP_POLICY    "caly_xdp_policy"  /* stage 2+ tail-call half */
 #define CALY_PROG_XDP_IPV6      "caly_xdp_ipv6"
 #define CALY_PROG_TC_INGRESS    "caly_tc_ingress"  /* clsact ingress, rung 3 */
 #define CALY_PROG_TC_EGRESS     "caly_tc_egress"
@@ -319,11 +320,19 @@ enum caly_xdp_mode {
  * CALY_PROG_IPV6 is OPTIONAL. It exists so the IPv6 path can be split out
  * when the verifier's instruction budget is tight (notably on RHEL 8 era
  * 4.18 backports). If the main program handles IPv6 inline, leave the slot
- * empty; the tail call fails and execution continues in the caller. */
+ * empty; the tail call fails and execution continues in the caller.
+ *
+ * CALY_PROG_POLICY is REQUIRED, not optional. caly_xdp_main parses the packet
+ * into the scratch map and tail-calls this slot to run stage 2 (anomalies)
+ * through the verdict. Splitting the single monolithic program in two is what
+ * keeps each half inside the ~1M verified-instruction complexity budget on a
+ * RHEL 9 / 5.14 verifier (the monolith loaded as -E2BIG). The loader MUST
+ * populate this slot before attaching caly_xdp_main; an empty slot makes the
+ * tail call fall through to a fail-open PASS. */
 enum caly_prog_idx {
 	CALY_PROG_IDX_SYNPROXY = 0,
 	CALY_PROG_IDX_IPV6     = 1,
-	CALY_PROG_IDX_RSVD2    = 2,
+	CALY_PROG_IDX_POLICY   = 2,
 	CALY_PROG_IDX_RSVD3    = 3,
 	CALY_PROG_IDX_MAX      = 4,
 };
@@ -886,6 +895,18 @@ struct caly_scratch {
 	struct conn_state cs;
 	struct ban_entry  ban;
 	__u64             tmp[8];
+
+	/* Cross-boundary carry for the caly_xdp_main -> caly_xdp_policy tail
+	 * call. These are the parser-half values the policy half still needs
+	 * that are NOT reconstructible from pkt above: the interface WAN/monitor
+	 * decision (which folds in the zone lookup) and the ICMP type/code word.
+	 * BPF-internal only, never touched by userspace, so growing the struct
+	 * here is safe. Kept 8-byte aligned by carry_pad. */
+	__u64             carry_if_flags;
+	__u32             carry_icmp_tc;
+	__u8              carry_is_wan;
+	__u8              carry_if_monitor;
+	__u8              carry_pad[2];
 };
 
 /* -------------------------------------------------------------------------
@@ -1598,7 +1619,7 @@ CALY_ASSERT(sizeof(struct src_stats) == 56,            src_stats_size);
 CALY_ASSERT(sizeof(struct event) == 88,                event_size);
 CALY_ASSERT(sizeof(struct iface_config) == 32,         iface_config_size);
 CALY_ASSERT(sizeof(struct pkt_ctx) == 96,              pkt_ctx_size);
-CALY_ASSERT(sizeof(struct caly_scratch) == 416,        caly_scratch_size);
+CALY_ASSERT(sizeof(struct caly_scratch) == 432,        caly_scratch_size);
 CALY_ASSERT(sizeof(struct fw_config) == CALY_FW_CONFIG_SIZE, fw_config_size);
 
 /* The scratch area exists precisely because these do not fit on the 512-byte

@@ -1135,13 +1135,15 @@ static int caly_fill_prog_array(struct caly_bpf *b)
 }
 
 /*
- * One load attempt.  `enable_synproxy` and `enable_ringbuf` let the caller
- * retry with features removed after a verifier rejection.
+ * One load attempt.  `enable_synproxy`, `enable_ringbuf` and
+ * `enable_tc_ingress` let the caller retry with individual programs or maps
+ * removed after a verifier rejection.
  */
 static int caly_load_attempt(struct caly_bpf *b,
 			     const struct caly_load_opts *opts,
 			     const struct fw_config *cfg,
-			     int enable_synproxy, int enable_ringbuf)
+			     int enable_synproxy, int enable_ringbuf,
+			     int enable_tc_ingress)
 {
 	LIBBPF_OPTS(bpf_object_open_opts, oo);
 	struct bpf_object *obj = NULL;
@@ -1234,6 +1236,24 @@ static int caly_load_attempt(struct caly_bpf *b,
 	} else if (enable_synproxy) {
 		caly_warn("BPF object has no '%s' program; the SYN proxy will "
 			  "not be available", CALY_PROG_XDP_SYNPROXY);
+	}
+
+	/* The tc/clsact ingress program (ladder rung 3) is a full second copy of
+	 * the filtering ladder and is only ever attached when XDP is entirely
+	 * unavailable - which never happens on any kernel that supports XDP
+	 * generic (SKB) mode, i.e. every kernel this daemon targets. It is also
+	 * large enough to exceed the verifier's complexity budget on some kernels
+	 * (RHEL9/5.14), where its rejection would fail the ENTIRE object load and
+	 * take the working XDP dataplane down with it. So unless the operator
+	 * explicitly selected the tc dataplane we compile it out with
+	 * autoload=false, exactly as the SYN proxy is handled for a missing
+	 * helper. When it is disabled the XDP-unavailable path descends straight
+	 * to nftables (rung 4) instead of tc (rung 3). */
+	p = bpf_object__find_program_by_name(obj, CALY_PROG_TC_INGRESS);
+	if (p != NULL && !enable_tc_ingress) {
+		if (bpf_program__set_autoload(p, false) != 0)
+			caly_warn("cannot disable autoload for '%s'",
+				  CALY_PROG_TC_INGRESS);
 	}
 
 	/* ---- ring buffer map ---- */
@@ -1351,10 +1371,12 @@ static int caly_load_attempt(struct caly_bpf *b,
 		b->prog_fd_tc_egress = bpf_program__fd(p);
 
 	/* Attached directly at clsact ingress (rung 3), never tail-called, so it
-	 * has a program-name macro but no CALY_PROG_IDX_* slot. Used only if the
-	 * BPF object happens to provide it. */
+	 * has a program-name macro but no CALY_PROG_IDX_* slot. Resolved only when
+	 * the tc dataplane is enabled; otherwise it was compiled out above with
+	 * autoload=false and its fd stays -1, so the XDP-unavailable path skips
+	 * rung 3 and descends to nftables. */
 	p = bpf_object__find_program_by_name(obj, CALY_PROG_TC_INGRESS);
-	if (p != NULL)
+	if (p != NULL && enable_tc_ingress)
 		b->prog_fd_tc_ingress = bpf_program__fd(p);
 
 	if (caly_fill_prog_array(b) != 0)
@@ -1375,7 +1397,7 @@ int caly_bpf_load(struct caly_bpf *b, const struct caly_load_opts *opts,
 {
 	struct caly_load_opts defaults;
 	struct caly_features feat;
-	int want_syn, want_rb;
+	int want_syn, want_rb, want_tc;
 	int i;
 
 	if (b == NULL)
@@ -1427,25 +1449,43 @@ int caly_bpf_load(struct caly_bpf *b, const struct caly_load_opts *opts,
 
 	want_syn = opts->want_synproxy && feat.have_synproxy;
 	want_rb = opts->want_ringbuf && feat.have_ringbuf;
+	/* The tc/clsact ingress dataplane is loaded only when the operator has
+	 * explicitly selected it; otherwise it is compiled out with
+	 * autoload=false (see caly_load_attempt) so its size can never fail the
+	 * object load and take the working XDP dataplane down with it. */
+	want_tc = (cfg != NULL && cfg->dataplane_pref == CALY_DP_TC);
 
-	caly_info("loading %s (synproxy=%s, ringbuf=%s)", b->obj_path,
-		  want_syn ? "on" : "off", want_rb ? "on" : "off");
+	caly_info("loading %s (synproxy=%s, ringbuf=%s, tc-ingress=%s)",
+		  b->obj_path, want_syn ? "on" : "off", want_rb ? "on" : "off",
+		  want_tc ? "on" : "off");
 
-	if (caly_load_attempt(b, opts, cfg, want_syn, want_rb) == 0)
+	if (caly_load_attempt(b, opts, cfg, want_syn, want_rb, want_tc) == 0)
 		goto loaded;
 
 	/*
-	 * Degrade rather than abort.  The first retry drops the SYN proxy,
-	 * which is the only program that can be rejected purely because of a
-	 * missing helper; the second drops the ring buffer, which is the only
-	 * map that can be rejected purely because of a missing map type.
+	 * Degrade rather than abort.  Each retry drops one component that can be
+	 * rejected on its own: first the tc/clsact ingress dataplane (a large
+	 * second copy of the ladder that can exceed the verifier complexity
+	 * budget), then the SYN proxy (rejected only for a missing helper), then
+	 * the ring buffer (rejected only for a missing map type).
 	 */
+	if (want_tc) {
+		caly_warn("load failed with the tc/clsact ingress dataplane "
+			  "enabled; retrying without it. XDP stays the "
+			  "dataplane; if XDP is unavailable on this NIC the "
+			  "daemon degrades to nftables (ladder rung 4).");
+		want_tc = 0;
+		if (caly_load_attempt(b, opts, cfg, want_syn, want_rb,
+				      want_tc) == 0)
+			goto loaded;
+	}
+
 	if (want_syn) {
 		caly_warn("load failed with the SYN proxy enabled; retrying "
 			  "without it. The per-source SYN token bucket and "
 			  "net.ipv4.tcp_syncookies=1 remain in effect.");
 		want_syn = 0;
-		if (caly_load_attempt(b, opts, cfg, want_syn, want_rb) == 0)
+		if (caly_load_attempt(b, opts, cfg, want_syn, want_rb, want_tc) == 0)
 			goto loaded;
 	}
 
@@ -1453,7 +1493,7 @@ int caly_bpf_load(struct caly_bpf *b, const struct caly_load_opts *opts,
 		caly_warn("load failed with the ring buffer enabled; retrying "
 			  "with the perf event array only");
 		want_rb = 0;
-		if (caly_load_attempt(b, opts, cfg, want_syn, want_rb) == 0)
+		if (caly_load_attempt(b, opts, cfg, want_syn, want_rb, want_tc) == 0)
 			goto loaded;
 	}
 
@@ -1471,7 +1511,8 @@ int caly_bpf_load(struct caly_bpf *b, const struct caly_load_opts *opts,
 			  b->pin_dir);
 		nopin.reuse_pins = 0;
 		if (caly_unpin_all(b->pin_dir) == 0 &&
-		    caly_load_attempt(b, &nopin, cfg, want_syn, want_rb) == 0) {
+		    caly_load_attempt(b, &nopin, cfg, want_syn, want_rb,
+				      want_tc) == 0) {
 			/* Re-pin explicitly since the pin paths were not set
 			 * before load on this attempt. */
 			for (i = 0; i < CALY_MID_MAX; i++) {

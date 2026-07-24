@@ -1108,6 +1108,8 @@ static int caly_fill_prog_array(struct caly_bpf *b)
 			fd = b->prog_fd_ipv6;
 		else if (idx == CALY_PROG_IDX_POLICY)
 			fd = b->prog_fd_policy;
+		else if (idx == CALY_PROG_IDX_PARSE)
+			fd = b->prog_fd_parse;
 
 		if (fd >= 0) {
 			if (bpf_map_update_elem(progs_fd, &idx, &fd,
@@ -1146,6 +1148,7 @@ static int caly_load_attempt(struct caly_bpf *b,
 
 	b->obj = NULL;
 	b->prog_fd_main = -1;
+	b->prog_fd_parse = -1;
 	b->prog_fd_policy = -1;
 	b->prog_fd_synproxy = -1;
 	b->prog_fd_ipv6 = -1;
@@ -1183,6 +1186,19 @@ static int caly_load_attempt(struct caly_bpf *b,
 	if (p == NULL) {
 		caly_err("BPF object has no program named '%s'",
 			 CALY_PROG_XDP_POLICY);
+		goto fail;
+	}
+
+	/* The parse half is REQUIRED too: caly_xdp_main tail-calls it to run the
+	 * L3/L4 parse, which then tail-calls caly_xdp_policy. Splitting the parse
+	 * into its own program is what keeps caly_xdp_main inside the verifier
+	 * complexity budget. It autoloads by default (a normal SEC("xdp")
+	 * program); we only verify it is present so a stripped object fails loudly
+	 * here rather than silently failing open. */
+	p = bpf_object__find_program_by_name(obj, CALY_PROG_XDP_PARSE);
+	if (p == NULL) {
+		caly_err("BPF object has no program named '%s'",
+			 CALY_PROG_XDP_PARSE);
 		goto fail;
 	}
 
@@ -1271,6 +1287,16 @@ static int caly_load_attempt(struct caly_bpf *b,
 	b->prog_fd_main = (p != NULL) ? bpf_program__fd(p) : -1;
 	if (b->prog_fd_main < 0) {
 		caly_err("'%s' did not load", CALY_PROG_XDP_MAIN);
+		goto fail;
+	}
+
+	/* Required: caly_fill_prog_array() installs this fd into caly_progs slot
+	 * CALY_PROG_IDX_PARSE below, before caly_xdp_main is ever attached, so the
+	 * main -> parse tail call always has a live target. */
+	p = bpf_object__find_program_by_name(obj, CALY_PROG_XDP_PARSE);
+	b->prog_fd_parse = (p != NULL) ? bpf_program__fd(p) : -1;
+	if (b->prog_fd_parse < 0) {
+		caly_err("'%s' did not load", CALY_PROG_XDP_PARSE);
 		goto fail;
 	}
 
@@ -1480,6 +1506,7 @@ int caly_bpf_open_pinned(struct caly_bpf *b, const char *pin_dir)
 	for (i = 0; i < CALY_MID_MAX; i++)
 		b->map_fd[i] = -1;
 	b->prog_fd_main = -1;
+	b->prog_fd_parse = -1;
 	b->prog_fd_policy = -1;
 	b->prog_fd_synproxy = -1;
 	b->prog_fd_ipv6 = -1;
@@ -1539,6 +1566,7 @@ void caly_bpf_close(struct caly_bpf *b)
 	}
 
 	b->prog_fd_main = -1;
+	b->prog_fd_parse = -1;
 	b->prog_fd_policy = -1;
 	b->prog_fd_synproxy = -1;
 	b->prog_fd_ipv6 = -1;

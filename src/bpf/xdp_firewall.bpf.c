@@ -802,9 +802,7 @@ int caly_xdp_main(struct xdp_md *ctx)
 	__u32 zero = 0, key32;
 	__u32 reason = STAT_PASS_DEFAULT;
 	__u32 pkt_len, mode;
-	__u32 icmp_tc = 0;
 	__u32 eth_proto = 0;
-	__u32 rc;
 	__u16 cur_proto;
 	__u32 cur_off;
 	__u32 i;
@@ -989,6 +987,291 @@ int caly_xdp_main(struct xdp_md *ctx)
 		goto verdict;
 	}
 
+	/* L2 done. The L3/L4 parse - iteration over one IPv4/IPv6 header, its
+	 * extension headers and the L4 header, optionally one tunnel level - is
+	 * heavy packet-bounds work whose data/data_end re-validation overran the
+	 * verifier's state budget when it was inlined here (-E2BIG). It runs in
+	 * caly_xdp_parse, reached by this tail call, from a clean verifier state.
+	 * Hand it the L2 outputs it needs but cannot reconstruct: where L3 parsing
+	 * resumes (cur_off / cur_proto) and the interface WAN/monitor decision that
+	 * folds in the zone lookup. The parsed packet accumulates in sc->pkt across
+	 * the tail call (per-CPU scratch, same CPU, same packet). We only fall
+	 * through when the tail call could not happen (slot empty or the call limit
+	 * was hit): fail OPEN into the shared verdict block, never drop for missing
+	 * plumbing. */
+	sc->carry_l3_off = cur_off;
+	sc->carry_l3_proto = cur_proto;
+	sc->carry_is_wan = (__u8)is_wan;
+	sc->carry_if_monitor = (__u8)if_monitor;
+	sc->carry_if_flags = if_flags;
+
+	bpf_tail_call(ctx, &caly_progs, CALY_PROG_IDX_PARSE);
+	caly_stat(STAT_TAILCALL_FAIL, pkt_len);
+	reason = STAT_PASS_DEFAULT;
+	act = CALY_ACT_PASS;
+	goto verdict;
+
+	/* ---- Stage 11: accounting and verdict. Single exit point: every
+	 * packet is charged exactly one specific reason plus the aggregates,
+	 * and no path can return without doing so. ---- */
+verdict:
+	{
+		__u32 verdict_code;
+		int action;
+
+		/* Monitor mode rewrites the verdict but keeps the reason, so
+		 * `calyanti-cli stats` shows exactly what WOULD have been
+		 * dropped before the operator commits to dropping it. */
+		if (act == CALY_ACT_DROP &&
+		    ((flags & CALY_F_MONITOR_ONLY) ||
+		     mode == FW_MODE_MONITOR_ONLY || if_monitor)) {
+			caly_stat(STAT_MONITOR_WOULD_DROP, pkt_len);
+			act = CALY_ACT_PASS;
+			verdict_code = CALY_VERDICT_MONITOR;
+			want_event = 1;
+		} else if (act == CALY_ACT_DROP) {
+			verdict_code = CALY_VERDICT_DROP;
+			want_event = 1;
+		} else if (act == CALY_ACT_TX) {
+			verdict_code = CALY_VERDICT_TX;
+			want_event = 1;
+		} else {
+			verdict_code = CALY_VERDICT_PASS;
+		}
+
+		caly_stat(STAT_PKT_TOTAL, pkt_len);
+		if (reason != STAT_PKT_TOTAL)
+			caly_stat(reason, pkt_len);
+
+		if (act == CALY_ACT_DROP) {
+			caly_stat(STAT_DROP_TOTAL, pkt_len);
+			caly_gauge(CALY_G_DROPS, 1);
+			action = XDP_DROP;
+		} else if (act == CALY_ACT_TX) {
+			caly_stat(STAT_TX_TOTAL, pkt_len);
+			action = XDP_TX;
+		} else {
+			caly_stat(STAT_PASS_TOTAL, pkt_len);
+			action = XDP_PASS;
+		}
+
+		caly_gauge(CALY_G_PKTS, 1);
+		caly_gauge(CALY_G_BYTES, pkt_len);
+		if (is_syn)
+			caly_gauge(CALY_G_SYN, 1);
+		/* New-flow gauge tracks new inbound TCP connections, matching
+		 * the newconn bucket and the global_newconn escalation
+		 * thresholds; see the rate-limit stage for why UDP/ICMP misses
+		 * are excluded. */
+		if (is_syn && ct_missed)
+			caly_gauge(CALY_G_NEWCONN, 1);
+		if (pkt->proto == CALY_IPPROTO_UDP)
+			caly_gauge(CALY_G_UDP, 1);
+		if (is_icmp)
+			caly_gauge(CALY_G_ICMP, 1);
+		if (pkt->flags & CALY_PKT_F_FRAG)
+			caly_gauge(CALY_G_FRAG, 1);
+
+		/* Top-talker accounting. Reporting only; nothing in the drop
+		 * path ever reads it. */
+		if ((flags & CALY_F_SRC_STATS) && pkt->family) {
+			struct src_stats *ss;
+
+			if (is_v4)
+				ss = bpf_map_lookup_elem(&caly_top4, &skey4);
+			else
+				ss = bpf_map_lookup_elem(&caly_top6, &skey6);
+
+			if (ss) {
+				ss->packets += 1;
+				ss->bytes += pkt_len;
+				ss->last_seen_ns = now;
+				if (verdict_code == CALY_VERDICT_DROP ||
+				    verdict_code == CALY_VERDICT_MONITOR) {
+					ss->drops += 1;
+					ss->drop_bytes += pkt_len;
+					ss->last_reason = reason;
+				}
+			} else {
+				__builtin_memset(&tv.ts, 0, sizeof(tv.ts));
+				tv.ts.packets = 1;
+				tv.ts.bytes = pkt_len;
+				tv.ts.first_seen_ns = now;
+				tv.ts.last_seen_ns = now;
+				tv.ts.last_reason = reason;
+				if (verdict_code == CALY_VERDICT_DROP ||
+				    verdict_code == CALY_VERDICT_MONITOR) {
+					tv.ts.drops = 1;
+					tv.ts.drop_bytes = pkt_len;
+				}
+
+				if (is_v4)
+					err = bpf_map_update_elem(&caly_top4,
+								  &skey4,
+								  &tv.ts,
+								  BPF_ANY);
+				else
+					err = bpf_map_update_elem(&caly_top6,
+								  &skey6,
+								  &tv.ts,
+								  BPF_ANY);
+				if (err)
+					caly_stat(STAT_MAP_FULL_SRCSTAT, pkt_len);
+			}
+		}
+
+		/* Sampled events. Never emitted for an ordinary pass: at line
+		 * rate that would cost more CPU than the filtering does. */
+		if (want_event && (flags & CALY_F_LOG_EVENTS) &&
+		    cfg->log_sample_rate) {
+			struct event *ev = &sc->ev;
+			int emit = 1;
+
+			sc->tmp[CALY_TMP_EV_COUNT] += 1;
+			if (sc->tmp[CALY_TMP_EV_COUNT] < cfg->log_sample_rate) {
+				caly_stat(STAT_EVENT_SAMPLED_OUT, pkt_len);
+				emit = 0;
+			} else {
+				sc->tmp[CALY_TMP_EV_COUNT] = 0;
+			}
+
+			/* Hard events/sec ceiling, counted per CPU. */
+			if (emit && cfg->log_max_pps) {
+				__u64 ws = sc->tmp[CALY_TMP_EV_WIN_NS];
+
+				if (now < ws || now - ws >= CALY_NSEC_PER_SEC) {
+					sc->tmp[CALY_TMP_EV_WIN_NS] = now;
+					sc->tmp[CALY_TMP_EV_IN_WIN] = 0;
+				}
+				if (sc->tmp[CALY_TMP_EV_IN_WIN] >=
+				    cfg->log_max_pps) {
+					caly_stat(STAT_EVENT_SAMPLED_OUT,
+						  pkt_len);
+					emit = 0;
+				} else {
+					sc->tmp[CALY_TMP_EV_IN_WIN] += 1;
+				}
+			}
+
+			if (emit) {
+				__builtin_memset(ev, 0, sizeof(*ev));
+				ev->ts_ns = now;
+				ev->ban_ttl_ns = ban_ttl;
+				ev->value = evval;
+				__builtin_memcpy(ev->saddr, pkt->saddr,
+						 sizeof(ev->saddr));
+				__builtin_memcpy(ev->daddr, pkt->daddr,
+						 sizeof(ev->daddr));
+				ev->ifindex = pkt->ifindex;
+				ev->reason = reason;
+				ev->verdict = verdict_code;
+				ev->proto = pkt->proto;
+				ev->pkt_len = pkt_len;
+				ev->family = pkt->family;
+				ev->sport = pkt->sport;
+				ev->dport = pkt->dport;
+				ev->tcp_flags = (__u16)pkt->tcp_flags;
+				ev->mode = (__u8)mode;
+				ev->version = (__u8)CALY_ABI_VERSION_MAJOR;
+
+				err = bpf_perf_event_output(ctx, &caly_events,
+							    BPF_F_CURRENT_CPU,
+							    ev, sizeof(*ev));
+				if (err) {
+					caly_stat(STAT_EVENT_LOST, pkt_len);
+					caly_gauge(CALY_G_EVENTS_LOST, 1);
+				} else {
+					caly_stat(STAT_EVENT_EMITTED, pkt_len);
+					caly_gauge(CALY_G_EVENTS, 1);
+				}
+			}
+		}
+
+		return action;
+	}
+}
+
+SEC("xdp")
+int caly_xdp_parse(struct xdp_md *ctx)
+{
+	struct fw_config *cfg;
+	struct caly_scratch *sc;
+	struct pkt_ctx *pkt;
+
+	/* One reusable temporary big enough for the largest value we ever have
+	 * to build before inserting it into a map. Their lifetimes never
+	 * overlap, so a union keeps the stack far below the 512 byte limit. */
+	union {
+		struct rate_state rs;
+		struct scan_state sn;
+		struct src_stats  ts;
+	} tv;
+
+	struct in6_key skey6;
+	__u32 skey4 = 0;
+
+	__u64 flags, now, if_flags = 0, ban_ttl = 0, evval = 0;
+	__u32 zero = 0;
+	__u32 reason = STAT_PASS_DEFAULT;
+	__u32 pkt_len, mode;
+	__u32 icmp_tc = 0;
+	__u32 rc;
+	__u16 cur_proto;
+	__u32 cur_off;
+	__u32 i;
+	int act = CALY_ACT_PASS;
+	int is_wan = 0, if_monitor = 0, is_v4 = 1;
+	int ct_missed = 0;
+	int is_syn = 0, is_icmp = 0, want_event = 0;
+	long err;
+
+	/* Middle third of the dataplane. caly_xdp_main ran the prelude and L2
+	 * parse, stored the interface decision and the L3 resume offset/ethertype
+	 * in the scratch carry fields, and tail-called us. We re-establish those
+	 * inputs and run the L3/L4 parse - the heavy packet-bounds work that blew
+	 * the verifier's state budget when it was inlined into caly_xdp_main - from
+	 * a clean verifier state, then tail-call caly_xdp_policy. Packet access all
+	 * happens inside the force-inlined caly_parse_l3 (which takes ctx and
+	 * re-derives data/data_end and re-validates every offset against data_end),
+	 * so this function needs no data/data_end of its own. */
+
+	cfg = bpf_map_lookup_elem(&caly_config, &zero);
+	if (!cfg) {
+		caly_stat(STAT_PKT_TOTAL, 0);
+		caly_stat(STAT_CONFIG_MISSING, 0);
+		caly_stat(STAT_PASS_TOTAL, 0);
+		return XDP_PASS;
+	}
+
+	sc = bpf_map_lookup_elem(&caly_scratch, &zero);
+	if (!sc) {
+		caly_stat(STAT_PKT_TOTAL, 0);
+		caly_stat(STAT_SCRATCH_FAIL, 0);
+		caly_stat(STAT_PASS_TOTAL, 0);
+		return XDP_PASS;
+	}
+
+	pkt = &sc->pkt;
+	flags = cfg->flags;
+	mode = cfg->mode;
+	now = pkt->ts_ns;
+	pkt_len = pkt->pkt_len;
+
+	/* skey6 must be fully zeroed before use: any parse-error exit reaches the
+	 * verdict block below, whose top-talker accounting builds a per-source key
+	 * from it, and a hash key with uninitialised padding is both a verifier
+	 * error on 4.18 and a silent lookup miss. skey4 is already 0. */
+	__builtin_memset(&skey6, 0, sizeof(skey6));
+
+	/* L2 outputs carried across the tail call from caly_xdp_main. is_wan /
+	 * if_monitor / if_flags fold in the interface zone lookup and are NOT
+	 * reconstructible here; cur_off / cur_proto are where L3 parsing resumes. */
+	cur_off = sc->carry_l3_off;
+	cur_proto = sc->carry_l3_proto;
+	is_wan = sc->carry_is_wan;
+	if_monitor = sc->carry_if_monitor;
+	if_flags = sc->carry_if_flags;
+
 	/* L3 + L4. Iteration 0 parses the outer header; if it reports a tunnel
 	 * iteration 1 parses the inner one and policy sees the inner header.
 	 * CALY_TUNNEL_MAX_DEPTH is 1, so this is exactly two unrolled passes
@@ -1026,19 +1309,22 @@ int caly_xdp_main(struct xdp_md *ctx)
 		goto verdict;
 	}
 
+	/* Values policy still needs that are not reconstructible from sc->pkt: the
+	 * ICMP type/code word from this parse, and the interface decision carried
+	 * onward from caly_xdp_main unchanged. */
 	sc->carry_icmp_tc = icmp_tc;
 	sc->carry_is_wan = (__u8)is_wan;
 	sc->carry_if_monitor = (__u8)if_monitor;
 	sc->carry_if_flags = if_flags;
 
 	/* Stage 2 onward lives in caly_xdp_policy, reached by this tail call.
-	 * Splitting parse from policy is what keeps each half inside the verifier
-	 * complexity budget on RHEL 9 / 5.14 (the monolith failed to load, -E2BIG).
-	 * The parsed packet is already in sc->pkt and survives the tail call
-	 * (per-CPU scratch, same CPU, same packet). We only fall through when the
-	 * tail call could not happen (slot empty or the call limit was hit): fail
-	 * OPEN into the shared verdict block, never drop a parsed packet because
-	 * our own plumbing was missing. */
+	 * Splitting the L3/L4 parse from policy is what keeps each part inside the
+	 * verifier complexity budget on RHEL 9 / 5.14 (the monolith, and even the
+	 * two-way split, failed to load with -E2BIG). The parsed packet is already
+	 * in sc->pkt and survives the tail call (per-CPU scratch, same CPU, same
+	 * packet). We only fall through when the tail call could not happen (slot
+	 * empty or the call limit was hit): fail OPEN into the shared verdict block,
+	 * never drop a parsed packet because our own plumbing was missing. */
 	bpf_tail_call(ctx, &caly_progs, CALY_PROG_IDX_POLICY);
 	caly_stat(STAT_TAILCALL_FAIL, pkt_len);
 	reason = STAT_PASS_DEFAULT;
@@ -1047,7 +1333,8 @@ int caly_xdp_main(struct xdp_md *ctx)
 
 	/* ---- Stage 11: accounting and verdict. Single exit point: every
 	 * packet is charged exactly one specific reason plus the aggregates,
-	 * and no path can return without doing so. ---- */
+	 * and no path can return without doing so. Duplicated from caly_xdp_main
+	 * so a parse-error early exit here is accounted identically. ---- */
 verdict:
 	{
 		__u32 verdict_code;

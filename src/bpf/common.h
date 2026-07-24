@@ -184,6 +184,7 @@
 #define CALY_PROG_XDP_MAIN      "caly_xdp_main"
 #define CALY_PROG_XDP_SYNPROXY  "caly_xdp_synproxy"
 #define CALY_PROG_XDP_POLICY    "caly_xdp_policy"  /* stage 2+ tail-call half */
+#define CALY_PROG_XDP_PARSE     "caly_xdp_parse"   /* L3/L4 parse tail-call   */
 #define CALY_PROG_XDP_IPV6      "caly_xdp_ipv6"
 #define CALY_PROG_TC_INGRESS    "caly_tc_ingress"  /* clsact ingress, rung 3 */
 #define CALY_PROG_TC_EGRESS     "caly_tc_egress"
@@ -322,18 +323,21 @@ enum caly_xdp_mode {
  * 4.18 backports). If the main program handles IPv6 inline, leave the slot
  * empty; the tail call fails and execution continues in the caller.
  *
- * CALY_PROG_POLICY is REQUIRED, not optional. caly_xdp_main parses the packet
- * into the scratch map and tail-calls this slot to run stage 2 (anomalies)
- * through the verdict. Splitting the single monolithic program in two is what
- * keeps each half inside the ~1M verified-instruction complexity budget on a
- * RHEL 9 / 5.14 verifier (the monolith loaded as -E2BIG). The loader MUST
- * populate this slot before attaching caly_xdp_main; an empty slot makes the
- * tail call fall through to a fail-open PASS. */
+ * CALY_PROG_POLICY and CALY_PROG_PARSE are REQUIRED, not optional. The
+ * dataplane is a three-program tail-call chain: caly_xdp_main does the prelude
+ * and L2 parse and tail-calls CALY_PROG_IDX_PARSE (caly_xdp_parse), which does
+ * the L3/L4 parse and tail-calls CALY_PROG_IDX_POLICY (caly_xdp_policy) to run
+ * stage 2 (anomalies) through the verdict. Splitting the monolith three ways is
+ * what keeps each part inside the ~1M verified-instruction complexity budget on
+ * a RHEL 9 / 5.14 verifier (the monolith, and even the two-way split, loaded as
+ * -E2BIG because the L3/L4 parse alone overran the state budget). The loader
+ * MUST populate both slots before attaching caly_xdp_main; an empty slot makes
+ * the tail call fall through to a fail-open PASS. */
 enum caly_prog_idx {
 	CALY_PROG_IDX_SYNPROXY = 0,
 	CALY_PROG_IDX_IPV6     = 1,
 	CALY_PROG_IDX_POLICY   = 2,
-	CALY_PROG_IDX_RSVD3    = 3,
+	CALY_PROG_IDX_PARSE    = 3,
 	CALY_PROG_IDX_MAX      = 4,
 };
 
@@ -896,17 +900,22 @@ struct caly_scratch {
 	struct ban_entry  ban;
 	__u64             tmp[8];
 
-	/* Cross-boundary carry for the caly_xdp_main -> caly_xdp_policy tail
-	 * call. These are the parser-half values the policy half still needs
-	 * that are NOT reconstructible from pkt above: the interface WAN/monitor
-	 * decision (which folds in the zone lookup) and the ICMP type/code word.
-	 * BPF-internal only, never touched by userspace, so growing the struct
-	 * here is safe. Kept 8-byte aligned by carry_pad. */
+	/* Cross-boundary carry for the three-program tail-call chain
+	 * caly_xdp_main -> caly_xdp_parse -> caly_xdp_policy. These are values a
+	 * later stage needs that are NOT reconstructible from pkt above.
+	 * main -> parse: the L3 resume offset and ethertype (carry_l3_off /
+	 * carry_l3_proto) plus the interface WAN/monitor decision and per-iface
+	 * flags (which fold in the zone lookup). parse -> policy: the ICMP
+	 * type/code word (carry_icmp_tc), the interface decision carried onward
+	 * unchanged. BPF-internal only, never touched by userspace, so growing the
+	 * struct here is safe. Kept 8-byte aligned by carry_pad. */
 	__u64             carry_if_flags;
 	__u32             carry_icmp_tc;
+	__u32             carry_l3_off;
+	__u16             carry_l3_proto;
 	__u8              carry_is_wan;
 	__u8              carry_if_monitor;
-	__u8              carry_pad[2];
+	__u8              carry_pad[4];
 };
 
 /* -------------------------------------------------------------------------
@@ -1619,7 +1628,7 @@ CALY_ASSERT(sizeof(struct src_stats) == 56,            src_stats_size);
 CALY_ASSERT(sizeof(struct event) == 88,                event_size);
 CALY_ASSERT(sizeof(struct iface_config) == 32,         iface_config_size);
 CALY_ASSERT(sizeof(struct pkt_ctx) == 96,              pkt_ctx_size);
-CALY_ASSERT(sizeof(struct caly_scratch) == 432,        caly_scratch_size);
+CALY_ASSERT(sizeof(struct caly_scratch) == 440,        caly_scratch_size);
 CALY_ASSERT(sizeof(struct fw_config) == CALY_FW_CONFIG_SIZE, fw_config_size);
 
 /* The scratch area exists precisely because these do not fit on the 512-byte

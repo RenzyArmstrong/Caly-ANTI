@@ -152,6 +152,7 @@ struct caly_bpf {
 	int   map_fd[CALY_MID_MAX];
 
 	int   prog_fd_main;
+	int   prog_fd_parse;         /* REQUIRED L3/L4 parse tail-call target */
 	int   prog_fd_policy;        /* REQUIRED stage 2+ tail-call target   */
 	int   prog_fd_synproxy;
 	int   prog_fd_ipv6;
